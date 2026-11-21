@@ -13,9 +13,13 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().min(1).max(65535).default(5000),
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 
-  // --- Database (Milestone 3) --------------------------------------------
-  MONGODB_URI: z.string().trim().min(1).optional(),
-  MONGODB_DB_NAME: z.string().trim().min(1).optional(),
+  // --- Database (required from Milestone 2) -------------------------------
+  MONGODB_URI: z
+    .string()
+    .trim()
+    .min(1, 'MONGODB_URI is required')
+    .regex(/^mongodb(\+srv)?:\/\//, 'MONGODB_URI must start with mongodb:// or mongodb+srv://'),
+  MONGODB_DB_NAME: z.string().trim().min(1, 'MONGODB_DB_NAME is required'),
 
   // --- Authentication (Milestone 4) --------------------------------------
   BETTER_AUTH_SECRET: z.string().trim().min(1).optional(),
