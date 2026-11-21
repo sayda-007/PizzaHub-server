@@ -1,0 +1,28 @@
+# Dependencies
+node_modules/
+
+# Environment files (secrets must never be committed)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+
+# Build / test output
+dist/
+build/
+coverage/
+.nyc_output/
+*.tmp
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# npm caches
+.npm/
