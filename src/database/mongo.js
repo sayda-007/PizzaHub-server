@@ -82,6 +82,19 @@ export function getDb() {
   return database;
 }
 
+/**
+ * Give other modules access to the SAME connected client. Adapters that need
+ * transactions (for example Better Auth) receive this client instead of
+ * creating their own MongoClient, so the process keeps exactly one pool.
+ */
+export function getMongoClient() {
+  if (!client) {
+    throw new Error('MongoDB is not connected. Call connectToDatabase() during startup.');
+  }
+
+  return client;
+}
+
 /** Close the pool. Safe to call even if the connection never opened. */
 export async function disconnectFromDatabase() {
   if (!client) {

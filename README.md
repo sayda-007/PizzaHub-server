@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: MongoDB collection access and index initialization are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling and rate limiting are also in place. Authentication, business APIs, and payments are deliberately not implemented yet.
+> **Status: Better Auth is implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Business APIs, authorization middleware and payments are deliberately not implemented yet.
 
 ---
 
@@ -29,11 +29,12 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - 404 middleware for unknown routes
 - API rate limiting with JSON `429` responses
 - Graceful shutdown of both the HTTP server and MongoDB connection
+- Better Auth with email/password, optional Google OAuth, JWT/JWKS plugin and one shared MongoDB pool
+- Customer/vendor role selection at registration; role, block status and subscription changes owned exclusively by the server afterwards
 
 **Planned (later milestones)**
 
-- Better Auth (email/password + Google) hosted inside Express, MongoDB adapter, JWT plugin
-- JWKS-based JWT verification and role-based authorization
+- JWKS-based JWT verification middleware and role-based authorization
 - Vendor menu CRUD, availability, and subscription limits
 - Public menu browsing with search, filters, sorting, and pagination
 - Customer and vendor order workflows
@@ -50,8 +51,8 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | Language | JavaScript, ESM (`"type": "module"`) |
 | Web framework | Express 5 |
 | Database | MongoDB Atlas via the official `mongodb` Node.js driver |
-| Auth | Better Auth (from Milestone 4) |
-| JWT verification | `jose` (from Milestone 5) |
+| Auth | Better Auth 1.7 with the official MongoDB adapter and JWT plugin |
+| JWT verification | `jose` (planned; the `/token` and `/jwks` endpoints already exist) |
 | Payments | Stripe Checkout + webhooks (from Milestone 13) |
 | Validation | Zod |
 
@@ -65,8 +66,10 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | `zod` | Runtime validation of requests and environment variables |
 | `mongodb` | Official MongoDB driver: `MongoClient`, database selection, ping and close |
 | `express-rate-limit` | Shared API request limiter with standard rate-limit headers |
+| `better-auth` | Authentication hosted inside Express; JWT plugin from `better-auth/plugins` |
+| `@better-auth/mongo-adapter` | Official adapter that reuses the existing `Db` and `MongoClient` |
 
-Six runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
+Eight runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
 
 ## Project structure
 
@@ -79,10 +82,13 @@ server/
 └── src/
     ├── server.js                      # process entry point + graceful shutdown
     ├── app.js                         # Express app factory
+    ├── auth/
+    │   └── config/
+    │       └── better-auth.js         # Better Auth instance factory + user schema
     ├── config/
     │   └── env.js                     # Zod-validated environment variables
     ├── database/
-    │   ├── mongo.js                   # MongoClient lifecycle, getDb(), close
+    │   ├── mongo.js                   # MongoClient lifecycle, getDb(), getMongoClient(), close
     │   ├── collections.js             # collection names + business accessors
     │   └── indexes.js                 # idempotent index initialization
     ├── middlewares/
@@ -98,7 +104,7 @@ server/
             └── health.routes.js       # GET /api/health
 ```
 
-Planned folders: `auth/`, `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -110,7 +116,7 @@ npm install
 Copy-Item .env.example .env
 ```
 
-Edit `.env` with your local values, especially `MONGODB_URI` and `MONGODB_DB_NAME`. Do **not** commit it; `.gitignore` already excludes it.
+Edit `.env` with your local values, especially `MONGODB_URI`, `MONGODB_DB_NAME` and `BETTER_AUTH_SECRET` (at least 32 random characters; example placeholders are rejected). Do **not** commit it; `.gitignore` already excludes it. Google credentials can stay unset for local development.
 
 To connect to Atlas from your machine, add your current public IP to the cluster's Network Access (IP allowlist), and URL-encode special characters in the password inside the connection string.
 
@@ -136,7 +142,7 @@ The server listens on `PORT` (default `5000`).
 1. `connectToDatabase(env)` creates the client from `MONGODB_URI` and selects the database named by `MONGODB_DB_NAME`.
 2. It verifies connectivity with `{ ping: 1 }` before resolving.
 3. `src/server.js` awaits that call **before** `app.listen()`, so no request is accepted while the database is unavailable.
-4. `getDb()` gives future modules access to the same connection pool.
+4. `getDb()` gives other modules the selected database; `getMongoClient()` gives them the **same** client. Better Auth receives both, so it never opens a second pool and can use transactions on Atlas replica sets.
 5. `disconnectFromDatabase()` closes the pool during shutdown.
 
 If the connection fails, the process logs a fixed, descriptive message and exits with status `1`. The driver's raw error text is **never** logged, because it can contain the host, username or full connection string. Only a safe error name and numeric code are appended for debugging.
@@ -145,7 +151,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 
 ## Collections and indexes
 
-`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is listed as a name for future reference only: Better Auth will own it, and this milestone creates no competing users collection and inserts no records.
+`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. Better Auth also owns `session`, `account`, `verification` and `jwks`. No test users or business records are inserted by this milestone.
 
 `src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`.
 
@@ -189,10 +195,13 @@ No text index or price index is created yet: those serve search/sort endpoints t
 1. **Helmet** — security headers.
 2. **CORS** — environment-driven origin whitelist. It runs early so CORS headers are also present on error responses.
 3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
-4. **express.json** — parses JSON bodies up to 1 MB.
-5. **Feature routers** — currently `/api/health`; later modules mount under `/api`.
-6. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
-7. **Error handler** — always last, so it catches errors from every earlier layer.
+4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
+5. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
+6. **Feature routers** — currently `/api/health`; later modules mount under `/api`.
+7. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
+8. **Error handler** — always last, so it catches errors from every earlier layer.
+
+Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
 ## Error responses
 
@@ -219,15 +228,22 @@ All failures share one envelope:
 
 IETF draft-7 `RateLimit` and `RateLimit-Policy` headers are emitted, along with `Retry-After` when throttled. `/api/health` is exempt so monitoring probes are never throttled. When the limit is exceeded, the limiter passes an `ApiError(429, …, 'RATE_LIMITED')` to the centralized handler, giving the same JSON shape as every other error. The limiter uses the default in-process memory store; a shared store would be needed if the API is later scaled across multiple instances.
 
-No new environment variables were introduced in this milestone.
+Rate limiting has no dedicated environment variable. Authentication variables are listed below.
 
 ## API endpoints
 
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/api/health` | Public | Returns server status and a timestamp |
+| `GET` | `/api/auth/ok` | Public | Better Auth liveness check |
+| `GET` | `/api/auth/jwks` | Public | JWT plugin public keys used to verify tokens |
+| `GET` | `/api/auth/token` | Session | Returns a JWT for the signed-in user (401 otherwise) |
+| `POST` | `/api/auth/sign-up/email` | Public | Email/password registration; send `role: "customer"` or `"vendor"` |
+| `POST` | `/api/auth/sign-in/email` | Public | Email/password sign-in |
+| `GET` | `/api/auth/sign-in/social` | Public | Starts Google OAuth when configured |
+| `POST` | `/api/auth/sign-out` | Session | Ends the session |
 
-All other endpoints are part of later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -237,11 +253,11 @@ All other endpoints are part of later milestones.
 | `NODE_ENV` | Milestone 1 | `development`, `production`, or `test` |
 | `MONGODB_URI` | **Milestone 2 — required** | Atlas `mongodb+srv://` connection string; secret, never commit |
 | `MONGODB_DB_NAME` | **Milestone 2 — required** | Database name selected on connect |
-| `BETTER_AUTH_SECRET` | Milestone 4 | Secret, server-side only |
-| `BETTER_AUTH_URL` | Milestone 4 | Public URL of this API |
-| `CLIENT_URL` | Milestone 1 | Allowed browser origin |
-| `GOOGLE_CLIENT_ID` | Milestone 4 | OAuth credential |
-| `GOOGLE_CLIENT_SECRET` | Milestone 4 | OAuth credential, server-side only |
+| `BETTER_AUTH_SECRET` | **Milestone 5 — required** | At least 32 random characters; placeholders rejected; server-side only |
+| `BETTER_AUTH_URL` | **Milestone 5 — required** | Public URL of this API; base for OAuth callbacks and JWT issuer/audience |
+| `CLIENT_URL` | **Milestone 5 — required** | Trusted browser origin for the future Next.js client |
+| `GOOGLE_CLIENT_ID` | Milestone 5 — optional | OAuth credential; both Google variables must be real or both unset |
+| `GOOGLE_CLIENT_SECRET` | Milestone 5 — optional | OAuth credential, server-side only |
 | `STRIPE_SECRET_KEY` | Milestone 13 | Test-mode key during development |
 | `STRIPE_WEBHOOK_SECRET` | Milestone 13 | Verifies webhook signatures |
 | `STRIPE_PRICE_ID` | Milestone 13 | Premium plan price |
@@ -250,15 +266,34 @@ All other endpoints are part of later milestones.
 | `ADMIN_EMAIL` | Milestone 6 | Seed script only |
 | `ADMIN_PASSWORD` | Milestone 6 | Seed script only |
 
-`PORT` and `NODE_ENV` have defaults. `MONGODB_URI` and `MONGODB_DB_NAME` are now required. All remaining variables are parsed but optional until their milestone is implemented.
+`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in stays disabled) and a safe warning is printed; a real value for only one of the two is a startup error.
 
-## Authentication and authorization
+## Authentication architecture
 
-Better Auth will be the only authentication system and will be hosted inside this Express server. The future Next.js client will call it over HTTP. Public registration will never be able to assign the `admin` role, and users will never be able to change their own role or subscription through profile updates. Details will be documented when implemented in Milestones 4–6.
+`src/auth/config/better-auth.js` exports a `createAuth(env)` factory rather than a singleton. `server.js` connects MongoDB first; `createApp(env)` then builds the auth instance so the adapter can receive the already-open `Db` and `MongoClient`. No second client or connection pool is created.
+
+Configuration highlights:
+
+- `emailAndPassword.enabled = true` — email/password sign-up and sign-in. Passwords must be 6–128 characters and include at least one uppercase and one lowercase letter. This check applies only to `/sign-up/email`; Google OAuth is unaffected.
+- `user.modelName = "users"` — Better Auth's `user` model is stored in the required `users` collection. There is no separate user collection or hand-written auth system.
+- Additional user fields: `role` (public schema accepts `customer`/`vendor`, default `customer`; `admin` exists only for trusted server-created records), `isBlocked` (boolean, default `false`), `businessName` (string), `subscriptionPlan` (`free`/`premium`, default `free`) and `subscriptionExpiresAt` (date).
+- `role` is an accepted sign-up input, but the schema only knows `customer` and `vendor`. The global `before` hook rejects `admin` and any unexpected role value during sign-up; a missing role is defaulted by the create hook. `isBlocked`, `subscriptionPlan` and `subscriptionExpiresAt` remain `input: false` and are rejected if sent during registration.
+- Profile updates reject `role` and every other server-owned field. The `user.update.before` database hook deletes those fields as a second layer. **Public registration can never create an Admin, and users cannot change their own role, block status or subscription.**
+- The `create` database hook preserves a validated `customer`/`vendor` choice (including OAuth paths), defaults a missing/invalid role to `customer`, and always resets block/subscription fields to safe values. `businessName` is trimmed and capped at 120 characters. Future admin creation must use a server-side seed script, not a public endpoint.
+
+### Google OAuth setup
+
+Google is opt-in. Leave both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` unset for local development; email/password works on its own. To enable it:
+
+1. In Google Cloud Console → **APIs & Services → Credentials**, create an **OAuth client ID** of type **Web application**.
+2. Add the callback URL `http://localhost:5000/api/auth/callback/google` for local development (and `https://<your-domain>/api/auth/callback/google` in production). This comes from `BETTER_AUTH_URL`.
+3. Put the real client ID and secret in `.env` as `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`. Never commit them, and never paste the example placeholders.
+4. Restart the server. `GET /api/auth/sign-in/social` with `provider=google` then starts the flow.
+5. Set `CLIENT_URL` to the frontend origin so it is trusted for cross-origin auth requests.
 
 ## JWT verification
 
-The JWT plugin will expose token and JWKS endpoints. Protected routes will verify the signature, issuer, audience, and expiry with `jose`, then reload the user from MongoDB so role, block status, and subscription changes take effect immediately. Unauthenticated requests will return `401`; forbidden requests will return `403`.
+The JWT plugin is registered. `GET /api/auth/jwks` returns the public keys (Ed25519 by default), and `GET /api/auth/token` returns a signed token for a signed-in session. Future protected routes will verify the signature, issuer, audience and expiry with `jose`, then reload the user from MongoDB so role, block status and subscription changes take effect immediately. Unauthenticated requests will return `401`; forbidden requests will return `403`.
 
 ## Advanced search and sorting
 

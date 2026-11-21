@@ -1,7 +1,9 @@
+import { toNodeHandler } from 'better-auth/node';
 import cors from 'cors';
 import express from 'express';
 import helmet from 'helmet';
 
+import { createAuth } from './auth/config/better-auth.js';
 import { createErrorHandler } from './middlewares/error.js';
 import { notFound } from './middlewares/not-found.js';
 import { createApiLimiter } from './middlewares/rate-limit.js';
@@ -13,8 +15,11 @@ import healthRoutes from './modules/health/health.routes.js';
  * isolated instance later without starting a real network listener.
  *
  * Middleware order matters:
- * security headers -> CORS -> rate limit -> body parsing -> routes
- * -> 404 -> error handler (must be last).
+ * security headers -> CORS -> rate limit -> Better Auth handler -> body parsing
+ * -> routes -> 404 -> error handler (must be last).
+ *
+ * Better Auth must see the raw request stream, so it is mounted before
+ * express.json(). Express 5 uses the named wildcard `*splat`.
  */
 export function createApp(env) {
   const app = express();
@@ -41,6 +46,12 @@ export function createApp(env) {
 
   // Reject abusive clients early, before parsing their request bodies.
   app.use(createApiLimiter(env));
+
+  // Better Auth owns this entire route tree and parses its own bodies. It is
+  // created here because the adapter needs the MongoDB connection opened by
+  // server.js. All /api/auth/* routes bypass express.json().
+  const auth = createAuth(env);
+  app.all('/api/auth/*splat', toNodeHandler(auth));
 
   app.use(express.json({ limit: '1mb' }));
 
