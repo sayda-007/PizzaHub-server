@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, and role-based authorization middleware are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Protected business APIs and payments are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, and the Admin seed script are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Menu, order, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -34,6 +34,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - JWKS-based JWT verification with `jose` (one cached remote JWKS resolver)
 - Bearer-token authentication middleware backed by the current MongoDB user record
 - Reusable `requireRole(...roles)` authorization middleware
+- `GET /api/users/me` for the current user's safe profile
+- `PATCH /api/users/me` for `name`, `image`, and vendor-only `businessName`
+- Idempotent, server-only Admin seed that uses Better Auth's password hashing
 
 **Planned (later milestones)**
 
@@ -103,15 +106,24 @@ server/
     │   └── rate-limit.js              # shared API limiter
     ├── utils/
     │   └── api-error.js               # ApiError class + status helpers
+    ├── scripts/
+    │   └── seed-admin.js              # manual Admin seed via Better Auth
     ├── tests/
     │   ├── auth.test.js               # JWT, authentication and role tests
-    │   └── error.test.js              # focused error-handler tests
+    │   ├── error.test.js              # focused error-handler tests
+    │   ├── user.test.js               # profile endpoint tests with fakes
+    │   └── seed-admin.test.js         # seed tests with mocks + in-memory auth
     └── modules/
-        └── health/
-            └── health.routes.js       # GET /api/health
+        ├── health/
+        │   └── health.routes.js       # GET /api/health
+        └── user/
+            ├── user.routes.js         # /api/users/me routing
+            ├── user.controller.js     # Express handlers and safe JSON
+            ├── user.service.js        # explicit $set updates + reload
+            └── user.validator.js      # Zod profile validation
 ```
 
-Planned folders: `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `modules/{menu,browse,order,admin,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -138,9 +150,15 @@ npm run dev
 
 # Syntax checks
 npm run check
+
+# Tests (no database or network required)
+npm test
+
+# Create the Admin account described by ADMIN_* variables
+npm run seed:admin
 ```
 
-The server listens on `PORT` (default `5000`).
+The server listens on `PORT` (default `5000`). The seed command is a separate manual step; it is never started by `npm start` or `npm run dev`.
 
 ## Database connection
 
@@ -158,7 +176,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 
 ## Collections and indexes
 
-`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. Better Auth also owns `session`, `account`, `verification` and `jwks`. No test users or business records are inserted by this milestone.
+`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. Better Auth also owns `session`, `account`, `verification` and `jwks`. Tests use in-memory or injected fake stores and insert no Atlas records; the only code that creates an Admin is the explicit `npm run seed:admin` command.
 
 `src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`.
 
@@ -204,13 +222,13 @@ No text index or price index is created yet: those serve search/sort endpoints t
 3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
 4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
 5. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
-6. **Feature routers** — currently `/api/health`; later modules mount under `/api`.
+6. **Feature routers** — currently `/api/health` and `/api/users`; later modules mount under `/api`.
 7. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
 8. **Error handler** — always last, so it catches errors from every earlier layer.
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
-`authenticate` and `requireRole(...)` are ready for future business routes but are not mounted globally. A protected route will opt in explicitly, for example `app.delete('/api/menu/:id', authenticate, requireRole('vendor'), handler)`. No public test-only auth route was added to the production API.
+`authenticate` is mounted explicitly on `/api/users/me`. `requireRole(...)` remains ready for future role-specific business routes, for example `app.delete('/api/menu/:id', authenticate, requireRole('vendor'), handler)`. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
 
 ## Error responses
 
@@ -251,8 +269,10 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `POST` | `/api/auth/sign-in/email` | Public | Email/password sign-in |
 | `GET` | `/api/auth/sign-in/social` | Public | Starts Google OAuth when configured |
 | `POST` | `/api/auth/sign-out` | Session | Ends the session |
+| `GET` | `/api/users/me` | Bearer JWT | Returns the current user's safe profile |
+| `PATCH` | `/api/users/me` | Bearer JWT | Updates `name`, `image`, and vendor-only `businessName` |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*` uses the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -271,11 +291,11 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 | `STRIPE_WEBHOOK_SECRET` | Milestone 13 | Verifies webhook signatures |
 | `STRIPE_PRICE_ID` | Milestone 13 | Premium plan price |
 | `IMGBB_API_KEY` | Milestone 7 | Image upload key |
-| `ADMIN_NAME` | Milestone 6 | Seed script only |
-| `ADMIN_EMAIL` | Milestone 6 | Seed script only |
-| `ADMIN_PASSWORD` | Milestone 6 | Seed script only |
+| `ADMIN_NAME` | Admin seed script | Required only when running `npm run seed:admin`; placeholders are rejected |
+| `ADMIN_EMAIL` | Admin seed script | Real address required; `example.com`/`example.test` placeholders are rejected |
+| `ADMIN_PASSWORD` | Admin seed script | 6–128 characters with at least one uppercase and one lowercase letter |
 
-`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in stays disabled) and a safe warning is printed; a real value for only one of the two is a startup error.
+`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in stays disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them.
 
 ## Authentication architecture
 
@@ -285,10 +305,11 @@ Configuration highlights:
 
 - `emailAndPassword.enabled = true` — email/password sign-up and sign-in. Passwords must be 6–128 characters and include at least one uppercase and one lowercase letter. This check applies only to `/sign-up/email`; Google OAuth is unaffected.
 - `user.modelName = "users"` — Better Auth's `user` model is stored in the required `users` collection. There is no separate user collection or hand-written auth system.
-- Additional user fields: `role` (public schema accepts `customer`/`vendor`, default `customer`; `admin` exists only for trusted server-created records), `isBlocked` (boolean, default `false`), `businessName` (string), `subscriptionPlan` (`free`/`premium`, default `free`) and `subscriptionExpiresAt` (date).
-- `role` is an accepted sign-up input, but the schema only knows `customer` and `vendor`. The global `before` hook rejects `admin` and any unexpected role value during sign-up; a missing role is defaulted by the create hook. `isBlocked`, `subscriptionPlan` and `subscriptionExpiresAt` remain `input: false` and are rejected if sent during registration.
+- Additional user fields: `role` (public schema accepts `customer`/`vendor`, default `customer`; `admin` exists only for records created by the trusted seed script), `isBlocked` (boolean, default `false`), `businessName` (string), `subscriptionPlan` (`free`/`premium`, default `free`) and `subscriptionExpiresAt` (date).
+- `createAuth(env)` disables Admin creation by default. The only way to enable the special path is `createAuth(env, { allowAdminCreation: true })`, used by the seed script. Even then, Admin is accepted only from a direct `auth.api` call with no `headers` and no `request`; an HTTP-style sign-up is still rejected.
+- `role` is an accepted sign-up input, but the schema only knows `customer` and `vendor`. The global `before` hook rejects `admin` and any unexpected role value on HTTP sign-up requests. A missing role is still defaulted by the create hook. `isBlocked`, `subscriptionPlan` and `subscriptionExpiresAt` remain `input: false` and are rejected if sent during registration.
 - Profile updates reject `role` and every other server-owned field. The `user.update.before` database hook deletes those fields as a second layer. **Public registration can never create an Admin, and users cannot change their own role, block status or subscription.**
-- The `create` database hook preserves a validated `customer`/`vendor` choice (including OAuth paths), defaults a missing/invalid role to `customer`, and always resets block/subscription fields to safe values. `businessName` is trimmed and capped at 120 characters. Future admin creation must use a server-side seed script, not a public endpoint.
+- The `create` database hook preserves a validated `customer`/`vendor` choice (including OAuth paths), defaults a missing/invalid role to `customer`, and always resets block/subscription fields to safe values. It preserves `admin` only when the explicit seed-only option and the direct-call shape are both present. `businessName` is trimmed and capped at 120 characters.
 
 ### Google OAuth setup
 
@@ -349,6 +370,48 @@ Authentication and authorization stay separate: `authenticate` answers **who the
 | `403 FORBIDDEN` | The token and user are valid, but the account is blocked or its database role is not allowed for the route. |
 
 Both use the normal JSON error envelope. The messages are fixed and safe; internal verification and database details are never exposed.
+
+## Profile API
+
+The four files in `src/modules/user/` keep the profile feature small and testable:
+
+| File | Responsibility |
+| --- | --- |
+| `user.routes.js` | Mounts `/me` with `authenticate` per route |
+| `user.controller.js` | Reads `req.user`, calls the service, returns `{ user }` |
+| `user.service.js` | Builds an explicit `$set`, writes, reloads, sanitizes |
+| `user.validator.js` | Strict Zod validation of the request body |
+
+`GET /api/users/me` requires `Authorization: Bearer <jwt>`. A session cookie is deliberately not accepted. The token is verified, the user is reloaded from MongoDB, and the response contains only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan` and `subscriptionExpiresAt`. Password hashes, reset tokens, `isBlocked` and other private fields are excluded by the same `sanitizeUser()` helper used by the authentication middleware.
+
+`PATCH /api/users/me` accepts only:
+
+- `name` — trimmed text, 1–120 characters
+- `image` — an `http`/`https` URL or `null` to clear it
+- `businessName` — vendor-only, or `null` to clear it
+
+The body is parsed with Zod `.strict()`, so an empty body returns `400 EMPTY_UPDATE`, an unknown field returns `400 VALIDATION_ERROR`, and reserved fields such as `role`, `email`, `isBlocked`, `subscriptionPlan` or `password` return `400 FORBIDDEN_FIELD`. A non-vendor sending `businessName` gets `403 FORBIDDEN_FIELD`.
+
+The service builds `$set` from its own allow-list; `req.body` is never spread into MongoDB. It adds a server-generated `updatedAt`, writes with `updateOne`, then reloads the user and returns the sanitized profile. A blocked user gets `403`, a deleted user gets `401`, and infrastructure failures become generic `500` responses through the centralized handler.
+
+## Admin seed script
+
+Run the seed manually after replacing the three `ADMIN_*` placeholders in `.env`:
+
+```powershell
+npm run seed:admin
+```
+
+The flow is intentionally narrow:
+
+1. `loadEnv()` checks the normal required configuration, then `validateAdminConfig()` checks `ADMIN_NAME`, `ADMIN_EMAIL` and `ADMIN_PASSWORD` **before** any database work. Passwords must be 6–128 characters with at least one uppercase and one lowercase letter. Example/placeholder values are rejected, and no entered value is ever printed.
+2. `connectToDatabase(env)` opens the same MongoDB pool the API uses; `disconnectFromDatabase()` runs in a `finally` block.
+3. `findUserByEmail()` looks up the lowercased address in Better Auth's `users` collection using a small projection.
+4. An existing **Admin** is a no-op with a friendly log message. An existing email with another role produces a safe `409 ADMIN_EMAIL_IN_USE` error; the script never changes that account.
+5. The seed creates its Better Auth instance with `createAuth(env, { allowAdminCreation: true })`. `createAuth(env)` without that option always rejects Admin creation. The new Admin is then created with `auth.api.signUpEmail({ body: { ..., role: 'admin' } })`. There are deliberately **no `headers` and no `request`** in that call: browser requests always have both, so the hook requires both the explicit option and this direct-call shape. The create hook preserves `admin`, Better Auth hashes the password into the `account` collection, and the same adapter writes through the shared pool.
+6. If two seeds race and the duplicate-email error is returned, the script re-checks the email. A winning Admin record becomes the same no-op; a non-Admin becomes the safe `409`.
+
+No Admin plugin was added. The plugin installed with Better Auth 1.7.27 defaults roles to `user`/`admin` and adds ban fields, which conflicts with this project's `customer`/`vendor` role schema and its own `isBlocked` field. The direct server-only `signUpEmail` call uses the documented Better Auth server API and the project's existing hooks, so no new package or second auth system is needed.
 
 ## Advanced search and sorting
 

@@ -58,11 +58,44 @@ function isPublicRegistrationRole(value) {
 }
 
 /**
- * Second layer for non-API paths (for example OAuth profile mapping): keep a
- * valid customer/vendor choice, otherwise fall back to the safe default.
+ * A direct `auth.api.*` call has no HTTP request or headers. Express always
+ * supplies both to Better Auth, so this is the narrow, documented signal that
+ * the call came from trusted server code (the seed script), not a browser.
  */
-function resolveRegistrationRole(value) {
-  return isPublicRegistrationRole(value) ? value : USER_ROLES.CUSTOMER;
+export function isTrustedServerOnlyAuthCall(context) {
+  if (!context || typeof context !== 'object') {
+    return false;
+  }
+
+  return !context.request && !context.headers;
+}
+
+/** Admin creation is an explicit opt-in, never a default of createAuth(). */
+export function isAdminCreationAllowed(options) {
+  return options?.allowAdminCreation === true;
+}
+
+/**
+ * Second layer for non-API paths (for example OAuth profile mapping): keep a
+ * valid customer/vendor choice. Admin is accepted only when BOTH conditions
+ * hold: the Better Auth instance was explicitly created with
+ * `allowAdminCreation: true`, and the call is a direct server-side API call
+ * with no HTTP request or headers. Every other source falls back to customer.
+ */
+export function resolveRegistrationRole(value, context, options = {}) {
+  if (isPublicRegistrationRole(value)) {
+    return value;
+  }
+
+  if (
+    value === USER_ROLES.ADMIN &&
+    isAdminCreationAllowed(options) &&
+    isTrustedServerOnlyAuthCall(context)
+  ) {
+    return USER_ROLES.ADMIN;
+  }
+
+  return USER_ROLES.CUSTOMER;
 }
 
 /**
@@ -103,12 +136,19 @@ function validateEmailPassword(password) {
 }
 
 /**
- * Build the single Better Auth instance for the process.
+ * Build a Better Auth instance.
  *
  * This is a factory on purpose: the adapter needs the MongoDB connection that
  * server.js opens first, so creating the instance at import time would fail.
+ *
+ * `allowAdminCreation` is OFF by default. Only the seed script may turn it on,
+ * and even then the Admin role is accepted only from a direct server-side
+ * auth.api call with no HTTP request or headers.
  */
-export function createAuth(env) {
+export function createAuth(env, options = {}) {
+  const allowAdminCreation = isAdminCreationAllowed(options);
+  const database = options.database;
+
   // Google is enabled only when real credentials are configured. Local
   // development works with email/password alone.
   const socialProviders = {};
@@ -127,7 +167,7 @@ export function createAuth(env) {
 
     // One driver, one database, one client: no second connection pool. Passing
     // the client also enables transactions on Atlas replica sets.
-    database: mongodbAdapter(getDb(), { client: getMongoClient() }),
+    database: database ?? mongodbAdapter(getDb(), { client: getMongoClient() }),
 
     emailAndPassword: {
       enabled: true,
@@ -144,8 +184,8 @@ export function createAuth(env) {
       modelName: COLLECTIONS.USERS,
       additionalFields: {
         role: {
-          // The schema itself only knows the two public roles. Admin records
-          // must be created by a future trusted seed script, not this API.
+          // The public schema only knows the two public roles. Admin is created
+          // exclusively by the trusted server-only seed script.
           type: [...PUBLIC_REGISTRATION_ROLES],
           required: false,
           defaultValue: USER_ROLES.CUSTOMER,
@@ -181,10 +221,10 @@ export function createAuth(env) {
         create: {
           // Runs for every sign-up method (email/password and OAuth). A valid
           // public choice is preserved; anything else becomes a customer.
-          before: async (user) => ({
+          before: async (user, context) => ({
             data: {
               ...user,
-              role: resolveRegistrationRole(user.role),
+              role: resolveRegistrationRole(user.role, context, { allowAdminCreation }),
               isBlocked: false,
               subscriptionPlan: SUBSCRIPTION_PLANS.FREE,
               subscriptionExpiresAt: null,
@@ -224,9 +264,19 @@ export function createAuth(env) {
 
         const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
 
-        // Registration is the one place where `role` is allowed, but only with
-        // an exact public value. Admin and unknown values never reach the DB.
-        if (isRegistration && 'role' in body && !isPublicRegistrationRole(body.role)) {
+        // Registration is the one place where `role` is allowed, but a browser
+        // may only choose a public role. Admin needs BOTH the explicit seed-only
+        // opt-in on this Better Auth instance AND a direct server-side call.
+        if (
+          isRegistration &&
+          'role' in body &&
+          !isPublicRegistrationRole(body.role) &&
+          !(
+            body.role === USER_ROLES.ADMIN &&
+            allowAdminCreation &&
+            isTrustedServerOnlyAuthCall(ctx)
+          )
+        ) {
           throw new APIError('BAD_REQUEST', {
             message: `Role must be one of: ${PUBLIC_REGISTRATION_ROLES.join(', ')}.`,
           });

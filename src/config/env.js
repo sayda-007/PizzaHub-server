@@ -53,7 +53,9 @@ const envSchema = z
     // --- ImgBB uploads (Milestone 7) ---------------------------------------
     IMGBB_API_KEY: z.string().trim().min(1).optional(),
 
-    // --- Admin seed script (Milestone 6) -----------------------------------
+    // --- Admin seed script (manual; optional at server startup) -------------
+    // loadEnv() includes these so `npm run seed:admin` receives them. The seed
+    // script performs the stricter validation when it actually runs.
     ADMIN_NAME: z.string().trim().min(1).optional(),
     ADMIN_EMAIL: z.email().optional(),
     ADMIN_PASSWORD: z.string().trim().min(1).optional(),

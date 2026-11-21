@@ -8,6 +8,7 @@ import { createErrorHandler } from './middlewares/error.js';
 import { notFound } from './middlewares/not-found.js';
 import { createApiLimiter } from './middlewares/rate-limit.js';
 import healthRoutes from './modules/health/health.routes.js';
+import { createUserRoutes } from './modules/user/user.routes.js';
 
 /**
  * Build and return an Express application.
@@ -58,6 +59,7 @@ export function createApp(env) {
   // Feature routers are mounted under /api. More modules arrive in later
   // milestones through src/routes/index.js.
   app.use('/api/health', healthRoutes);
+  app.use('/api/users', createUserRoutes(env));
 
   app.use(notFound);
   app.use(createErrorHandler(env));
