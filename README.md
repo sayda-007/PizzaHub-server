@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Milestone 3 of 15.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling and rate limiting are implemented. Authentication, business APIs, and payments are deliberately not implemented yet.
+> **Status: MongoDB collection access and index initialization are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling and rate limiting are also in place. Authentication, business APIs, and payments are deliberately not implemented yet.
 
 ---
 
@@ -21,6 +21,8 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - MongoDB Atlas connection with the official driver, selected by `MONGODB_DB_NAME`
 - Startup blocked until MongoDB responds to a ping
 - Sanitized database errors that never print the connection string or credentials
+- Centralized collection names and accessors for the three business collections
+- Idempotent index initialization before the HTTP listener starts
 - Health-check endpoint
 - Reusable `ApiError` class carrying a safe message, HTTP status and error code
 - Centralized JSON error responses (4xx details, generic 5xx message in production)
@@ -30,7 +32,6 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 
 **Planned (later milestones)**
 
-- Collection helpers and indexes
 - Better Auth (email/password + Google) hosted inside Express, MongoDB adapter, JWT plugin
 - JWKS-based JWT verification and role-based authorization
 - Vendor menu CRUD, availability, and subscription limits
@@ -81,19 +82,23 @@ server/
     ├── config/
     │   └── env.js                     # Zod-validated environment variables
     ├── database/
-    │   └── mongo.js                   # MongoClient lifecycle, getDb(), close
+    │   ├── mongo.js                   # MongoClient lifecycle, getDb(), close
+    │   ├── collections.js             # collection names + business accessors
+    │   └── indexes.js                 # idempotent index initialization
     ├── middlewares/
     │   ├── error.js                   # centralized JSON error responses
     │   ├── not-found.js               # 404 for unknown routes
     │   └── rate-limit.js              # shared API limiter
     ├── utils/
     │   └── api-error.js               # ApiError class + status helpers
+    ├── tests/
+    │   └── error.test.js              # focused error-handler tests
     └── modules/
         └── health/
             └── health.routes.js       # GET /api/health
 ```
 
-Planned folders: `auth/`, `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`, `tests/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `auth/`, `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -137,6 +142,45 @@ The server listens on `PORT` (default `5000`).
 If the connection fails, the process logs a fixed, descriptive message and exits with status `1`. The driver's raw error text is **never** logged, because it can contain the host, username or full connection string. Only a safe error name and numeric code are appended for debugging.
 
 `/api/health` intentionally remains a pure liveness check and does not query MongoDB. Since the server cannot start without a working database connection, a separate database field in that response would be redundant and would make a liveness probe fail for external reasons.
+
+## Collections and indexes
+
+`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is listed as a name for future reference only: Better Auth will own it, and this milestone creates no competing users collection and inserts no records.
+
+`src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`.
+
+### `menuItems`
+
+| Index | Purpose |
+| --- | --- |
+| `{ vendorId: 1, createdAt: -1 }` | Vendor's own items, newest first; the prefix also serves `vendorId`-only lookups. |
+| `{ status: 1, createdAt: -1 }` | Public browse uses `status: 'approved'` only; pending, rejected and inactive items are excluded by that single field. |
+| `{ category: 1, status: 1, createdAt: -1 }` | Category filter combined with the public status filter. |
+| `{ location: 1, status: 1, createdAt: -1 }` | Location filter combined with the public status filter. |
+| `{ createdAt: -1 }` | Admin listing of all submissions, newest first. |
+
+### `orders`
+
+| Index | Purpose |
+| --- | --- |
+| `{ customerId: 1, createdAt: -1 }` | Customer's own orders, newest first. |
+| `{ vendorId: 1, status: 1, createdAt: -1 }` | Vendor's incoming orders filtered by status. |
+| `{ itemId: 1, customerId: 1, deliveryDate: 1 }` | Duplicate active-order check. Deliberately **not** unique, because rejected/cancelled orders may be recreated. |
+| `{ deliveryDate: 1 }` | Delivery-date scheduling lookups. |
+
+### `transactions`
+
+| Index | Purpose |
+| --- | --- |
+| `{ stripeSessionId: 1 }` (unique, sparse) | Webhook idempotency. Safe because Stripe generates and owns this immutable value; `sparse` prevents incomplete records from colliding. |
+| `{ stripeSubscriptionId: 1 }` | Find records for one subscription when handling cancellation/expiration. |
+| `{ vendorId: 1, createdAt: -1 }` | Vendor's payment history, newest first. |
+| `{ status: 1, createdAt: -1 }` | Admin filtering by payment status. |
+| `{ createdAt: -1 }` | Admin listing of all transactions, newest first. |
+
+There is no separate `isAvailable` field: the assignment's `status` values (`pending`, `approved`, `rejected`, `inactive`) control public visibility. If the three obsolete indexes containing `isAvailable` exist from an earlier run, initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched.
+
+No text index or price index is created yet: those serve search/sort endpoints that are not implemented until a later milestone. The `_id` index is provided automatically by MongoDB.
 
 ## Middleware pipeline
 
