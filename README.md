@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, and vendor menu management with ImgBB uploads are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Public browsing, orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, and Free/Premium menu item limits are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Public browsing, orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -39,11 +39,11 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Idempotent, server-only Admin seed that uses Better Auth's password hashing
 - Vendor-only menu create, list, update, availability toggle and delete APIs
 - Ownership checks inside every MongoDB menu query
+- Server-side Free/Premium menu item limits with pending items reserving slots
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
-- Free/Premium menu item limits
 - Public menu browsing with search, filters, sorting, and pagination
 - Customer and vendor order workflows
 - Admin dashboard, moderation, and user management
@@ -323,9 +323,9 @@ Configuration highlights:
 
 - `emailAndPassword.enabled = true` — email/password sign-up and sign-in. Passwords must be 6–128 characters and include at least one uppercase and one lowercase letter. This check applies only to `/sign-up/email`; Google OAuth is unaffected.
 - `user.modelName = "users"` — Better Auth's `user` model is stored in the required `users` collection. There is no separate user collection or hand-written auth system.
-- Additional user fields: `role` (public schema accepts `customer`/`vendor`, default `customer`; `admin` exists only for records created by the trusted seed script), `isBlocked` (boolean, default `false`), `businessName` (string), `subscriptionPlan` (`free`/`premium`, default `free`) and `subscriptionExpiresAt` (date).
+- Additional user fields: `role` (public schema accepts `customer`/`vendor`, default `customer`; `admin` exists only for records created by the trusted seed script), `isBlocked` (boolean, default `false`), `businessName` (string), `subscriptionPlan` (`free`/`premium`, default `free`), `subscriptionStatus` (`active`/`inactive`/`past_due`/`canceled`, default `inactive`) and `subscriptionExpiresAt` (date).
 - `createAuth(env)` disables Admin creation by default. The only way to enable the special path is `createAuth(env, { allowAdminCreation: true })`, used by the seed script. Even then, Admin is accepted only from a direct `auth.api` call with no `headers` and no `request`; an HTTP-style sign-up is still rejected.
-- `role` is an accepted sign-up input, but the schema only knows `customer` and `vendor`. The global `before` hook rejects `admin` and any unexpected role value on HTTP sign-up requests. A missing role is still defaulted by the create hook. `isBlocked`, `subscriptionPlan` and `subscriptionExpiresAt` remain `input: false` and are rejected if sent during registration.
+- `role` is an accepted sign-up input, but the schema only knows `customer` and `vendor`. The global `before` hook rejects `admin` and any unexpected role value on HTTP sign-up requests. A missing role is still defaulted by the create hook. `isBlocked`, `subscriptionPlan`, `subscriptionStatus` and `subscriptionExpiresAt` remain `input: false` and are rejected if sent during registration.
 - Profile updates reject `role` and every other server-owned field. The `user.update.before` database hook deletes those fields as a second layer. **Public registration can never create an Admin, and users cannot change their own role, block status or subscription.**
 - The `create` database hook preserves a validated `customer`/`vendor` choice (including OAuth paths), defaults a missing/invalid role to `customer`, and always resets block/subscription fields to safe values. It preserves `admin` only when the explicit seed-only option and the direct-call shape are both present. `businessName` is trimmed and capped at 120 characters.
 
@@ -365,7 +365,7 @@ There is no second JWT secret and no duplicate auth system: the same Better Auth
 4. Accepts both ObjectId and string ids. The MongoDB adapter maps `id` to `_id` and normally stores an ObjectId, but string ids are supported too.
 5. Returns `401` if the user no longer exists.
 6. Returns `403` if `isBlocked === true` in MongoDB.
-7. Attaches a sanitized `req.user` containing only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan` and `subscriptionExpiresAt`. Password hashes, reset tokens and other private fields are never attached.
+7. Attaches a sanitized `req.user` containing only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan`, `subscriptionStatus` and `subscriptionExpiresAt`. Password hashes, reset tokens and other private fields are never attached.
 
 Role, subscription and blocked status are read from **MongoDB**, not from JWT claims. This means a role or ban change takes effect on the next request without waiting for the short-lived token to expire. Database failures and JWKS fetch failures are passed to the centralized error handler as generic `500` responses; they are never disguised as bad credentials or exposed to clients.
 
@@ -400,7 +400,7 @@ The four files in `src/modules/user/` keep the profile feature small and testabl
 | `user.service.js` | Builds an explicit `$set`, writes, reloads, sanitizes |
 | `user.validator.js` | Strict Zod validation of the request body |
 
-`GET /api/users/me` requires `Authorization: Bearer <jwt>`. A session cookie is deliberately not accepted. The token is verified, the user is reloaded from MongoDB, and the response contains only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan` and `subscriptionExpiresAt`. Password hashes, reset tokens, `isBlocked` and other private fields are excluded by the same `sanitizeUser()` helper used by the authentication middleware.
+`GET /api/users/me` requires `Authorization: Bearer <jwt>`. A session cookie is deliberately not accepted. The token is verified, the user is reloaded from MongoDB, and the response contains only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan`, `subscriptionStatus` and `subscriptionExpiresAt`. Password hashes, reset tokens, `isBlocked` and other private fields are excluded by the same `sanitizeUser()` helper used by the authentication middleware.
 
 `PATCH /api/users/me` accepts only:
 
@@ -408,7 +408,7 @@ The four files in `src/modules/user/` keep the profile feature small and testabl
 - `image` — an `http`/`https` URL or `null` to clear it
 - `businessName` — vendor-only, or `null` to clear it
 
-The body is parsed with Zod `.strict()`, so an empty body returns `400 EMPTY_UPDATE`, an unknown field returns `400 VALIDATION_ERROR`, and reserved fields such as `role`, `email`, `isBlocked`, `subscriptionPlan` or `password` return `400 FORBIDDEN_FIELD`. A non-vendor sending `businessName` gets `403 FORBIDDEN_FIELD`.
+The body is parsed with Zod `.strict()`, so an empty body returns `400 EMPTY_UPDATE`, an unknown field returns `400 VALIDATION_ERROR`, and reserved fields such as `role`, `email`, `isBlocked`, `subscriptionPlan`, `subscriptionStatus` or `password` return `400 FORBIDDEN_FIELD`. A non-vendor sending `businessName` gets `403 FORBIDDEN_FIELD`.
 
 The service builds `$set` from its own allow-list; `req.body` is never spread into MongoDB. It adds a server-generated `updatedAt`, writes with `updateOne`, then reloads the user and returns the sanitized profile. A blocked user gets `403`, a deleted user gets `401`, and infrastructure failures become generic `500` responses through the centralized handler.
 
@@ -448,17 +448,31 @@ A new item is submitted with `status: 'pending'` and `isAvailable: true`. Pendin
 - `status` is Admin-owned. Vendors cannot set or patch it. Admin moderation is a later milestone.
 - `isAvailable` is vendor-owned. `PATCH /api/menu/:id/availability` flips the current boolean value.
 
+### Subscription item limits
+
+Free vendors may reserve **3** menu-item slots. Premium vendors have no limit. Premium access is read from the current MongoDB user record and requires **all** of:
+
+- `subscriptionPlan: 'premium'`
+- `subscriptionStatus: 'active'`
+- `subscriptionExpiresAt` later than the current server time
+
+A slot is used only by an item that is available and has a slot-consuming status (`pending` or `approved`). Pending items reserve a slot, so vendors cannot create unlimited unapproved items. Unavailable, `rejected` and `inactive` items do not use a slot.
+
+The limit is checked before `POST /api/menu` uploads images and again in the menu service. `PATCH /api/menu/:id/availability` also checks the limit when an unavailable item is being made available again. A blocked request returns `409 MENU_ITEM_LIMIT_REACHED`; no upload is spent and no menu document is written. General `PATCH /api/menu/:id` cannot change availability, status or subscription fields, so it cannot bypass the limit.
+
+These fields are server-owned and will be updated by the later Stripe webhook milestone. They cannot be set by registration, profile updates or menu requests, and JWT subscription claims are ignored.
+
 ### Request rules
 
 Every endpoint requires `Authorization: Bearer <jwt>` and a MongoDB role of `vendor`. A session cookie is not accepted.
 
 - `POST /api/menu` expects `multipart/form-data`. Text fields are validated with strict Zod; the image files must be in the `images` field. Client-supplied image URL strings are rejected.
 - `GET /api/menu/mine` accepts `page` (default `1`, max `10000`) and `limit` (default `10`, max `50`) and returns `{ items, pagination }`.
-- `PATCH /api/menu/:id` accepts only `itemName`, `category`, `description`, `price`, `location` and `isAvailable`.
+- `PATCH /api/menu/:id` accepts only `itemName`, `category`, `description`, `price` and `location`. Availability has its own route.
 - `PATCH /api/menu/:id/availability` takes no body.
 - `DELETE /api/menu/:id` returns `204` on success.
 
-`vendorId`, `status`, `createdAt`, `updatedAt`, `images`, `_id` and `id` are reserved and rejected with `400 FORBIDDEN_FIELD`. Ids must be canonical 24-character MongoDB ObjectIds (`400 INVALID_MENU_ID` otherwise).
+`vendorId`, `status`, `createdAt`, `updatedAt`, `images`, `isAvailable`, `subscriptionPlan`, `subscriptionStatus`, `subscriptionExpiresAt`, `_id` and `id` are reserved and rejected with `400 FORBIDDEN_FIELD`. Ids must be canonical 24-character MongoDB ObjectIds (`400 INVALID_MENU_ID` otherwise).
 
 ### Ownership
 

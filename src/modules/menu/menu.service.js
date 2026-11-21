@@ -1,5 +1,9 @@
 import { ObjectId } from 'mongodb';
 
+import {
+  SUBSCRIPTION_PLANS,
+  SUBSCRIPTION_STATUS,
+} from '../../auth/config/better-auth.js';
 import { getMenuItemsCollection } from '../../database/collections.js';
 import { ApiError } from '../../utils/api-error.js';
 import {
@@ -9,6 +13,45 @@ import {
 } from './menu.validator.js';
 
 const OBJECT_ID_PATTERN = /^[0-9a-f]{24}$/i;
+
+/** Free vendors may reserve three slots; pending items count toward the limit. */
+export const FREE_MENU_ITEM_LIMIT = 3;
+
+const SLOT_MENU_STATUSES = Object.freeze([MENU_STATUS.PENDING, MENU_STATUS.APPROVED]);
+const LIMIT_MESSAGE =
+  `Free plan allows ${FREE_MENU_ITEM_LIMIT} active menu items. ` +
+  'Upgrade to Premium or make an item unavailable to add another.';
+
+function toTimestamp(value) {
+  const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
+
+  return Number.isFinite(timestamp) ? timestamp : NaN;
+}
+
+/**
+ * Premium access comes from the current MongoDB user snapshot on `req.user`.
+ * JWT claims and request bodies are never consulted. Both an active status and
+ * a future expiration are required, so Stripe webhooks can reuse these fields.
+ */
+export function isPremiumSubscription(user, now = new Date()) {
+  if (user?.subscriptionPlan !== SUBSCRIPTION_PLANS.PREMIUM) {
+    return false;
+  }
+
+  if (user?.subscriptionStatus !== SUBSCRIPTION_STATUS.ACTIVE) {
+    return false;
+  }
+
+  const expiresAt = toTimestamp(user.subscriptionExpiresAt);
+  const currentTime = toTimestamp(now);
+
+  return Number.isFinite(expiresAt) && Number.isFinite(currentTime) && expiresAt > currentTime;
+}
+
+/** Unavailable, rejected and inactive items do not reserve a slot. */
+export function menuItemConsumesSlot(item) {
+  return item?.isAvailable !== false && SLOT_MENU_STATUSES.includes(item?.status);
+}
 
 /**
  * Only a canonical 24-hex id is accepted. This avoids Node/NoSQL coercion such
@@ -33,6 +76,21 @@ function requireVendorId(vendorId) {
   }
 
   return vendorId;
+}
+
+/** Slot count is a MongoDB query so ownership and state cannot be faked by Express. */
+export function buildSlotFilter(vendorId, excludeId) {
+  const filter = {
+    vendorId: requireVendorId(vendorId),
+    status: { $in: [...SLOT_MENU_STATUSES] },
+    isAvailable: { $ne: false },
+  };
+
+  if (excludeId) {
+    filter._id = { $ne: excludeId };
+  }
+
+  return filter;
 }
 
 function validateStoredImageUrls(imageUrls) {
@@ -126,10 +184,35 @@ export function createMenuService(dependencies = {}) {
     return collectionSource ?? getMenuItemsCollection();
   }
 
-  async function create(vendorId, validatedData, imageUrls) {
+  async function countSlots(vendorId, excludeId) {
+    return getCollection().countDocuments(buildSlotFilter(vendorId, excludeId));
+  }
+
+  /** Premium users skip the count entirely; everyone else gets a fixed 409. */
+  async function assertSlotAvailable(vendorId, user, timestamp, excludeId) {
+    if (isPremiumSubscription(user, timestamp)) {
+      return;
+    }
+
+    const usedSlots = await countSlots(vendorId, excludeId);
+
+    if (usedSlots >= FREE_MENU_ITEM_LIMIT) {
+      throw ApiError.conflict(LIMIT_MESSAGE, 'MENU_ITEM_LIMIT_REACHED');
+    }
+  }
+
+  async function assertCanCreate(vendorId, user) {
+    await assertSlotAvailable(vendorId, user, now());
+  }
+
+  async function create(vendorId, validatedData, imageUrls, user) {
     const safeVendorId = requireVendorId(vendorId);
     const images = validateStoredImageUrls(imageUrls);
     const timestamp = now();
+
+    // Check again at the database boundary. The controller also checks before
+    // ImgBB upload so a rejected create never spends an external upload call.
+    await assertSlotAvailable(safeVendorId, user, timestamp);
 
     // status, isAvailable, vendorId and createdAt are server-owned. A caller
     // cannot supply them because validatedData contains only the five fields
@@ -203,7 +286,7 @@ export function createMenuService(dependencies = {}) {
     return serializeMenu(updated);
   }
 
-  async function toggleAvailability(vendorId, id) {
+  async function toggleAvailability(vendorId, id, user) {
     const filter = buildOwnedMenuFilter(vendorId, id);
     const existing = await getCollection().findOne(filter);
 
@@ -212,8 +295,17 @@ export function createMenuService(dependencies = {}) {
     }
 
     const current = existing.isAvailable !== false;
+    const next = !current;
+    const timestamp = now();
+
+    // Only a new active/reserved item needs a slot. Rejected or inactive items
+    // remain non-consuming even after an availability toggle.
+    if (next && menuItemConsumesSlot({ ...existing, isAvailable: next })) {
+      await assertSlotAvailable(vendorId, user, timestamp, filter._id);
+    }
+
     const result = await getCollection().updateOne(filter, {
-      $set: { isAvailable: !current, updatedAt: now() },
+      $set: { isAvailable: next, updatedAt: timestamp },
     });
 
     if ((result?.matchedCount ?? 0) === 0) {
@@ -240,5 +332,12 @@ export function createMenuService(dependencies = {}) {
     return { id: String(id) };
   }
 
-  return Object.freeze({ create, listMine, update, toggleAvailability, remove });
+  return Object.freeze({
+    assertCanCreate,
+    create,
+    listMine,
+    update,
+    toggleAvailability,
+    remove,
+  });
 }

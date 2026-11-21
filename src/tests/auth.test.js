@@ -61,6 +61,7 @@ async function signToken(options = {}) {
   const token = new SignJWT({
     role,
     subscriptionPlan: 'premium',
+    subscriptionStatus: 'active',
     isBlocked: false,
     passwordHash: 'must-not-be-trusted',
   }).setProtectedHeader({ alg: 'EdDSA', kid });
@@ -86,6 +87,7 @@ const VALID_USER = Object.freeze({
   businessName: null,
   isBlocked: false,
   subscriptionPlan: 'free',
+  subscriptionStatus: 'inactive',
   subscriptionExpiresAt: null,
   passwordHash: 'secret-hash',
   resetToken: 'secret-reset-token',
@@ -390,6 +392,7 @@ test('a valid user receives a sanitized req.user', async () => {
       role: 'customer',
       businessName: null,
       subscriptionPlan: 'free',
+      subscriptionStatus: 'inactive',
       subscriptionExpiresAt: null,
     },
   });
@@ -437,6 +440,17 @@ test('authorization uses the current database role, not a JWT role claim', async
   const me = await bearerGet('/me', token);
   assert.equal(me.status, 200);
   assert.equal((await me.json()).user.role, 'customer');
+});
+
+test('subscription JWT claims are ignored in favor of MongoDB values', async () => {
+  const token = await signToken({ role: 'customer' });
+  const response = await bearerGet('/me', token);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.user.subscriptionPlan, 'free');
+  assert.equal(body.user.subscriptionStatus, 'inactive');
+  assert.equal(body.user.subscriptionExpiresAt, null);
 });
 
 test('database errors reach the centralized handler and are not exposed', async () => {

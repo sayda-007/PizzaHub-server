@@ -7,7 +7,11 @@ import { ObjectId } from 'mongodb';
 import { createAuthenticate } from '../middlewares/authenticate.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { createMenuRoutes } from '../modules/menu/menu.routes.js';
-import { createMenuService } from '../modules/menu/menu.service.js';
+import {
+  FREE_MENU_ITEM_LIMIT,
+  createMenuService,
+} from '../modules/menu/menu.service.js';
+import { MENU_STATUS } from '../modules/menu/menu.validator.js';
 import {
   MAX_IMAGE_FILE_SIZE_BYTES,
   validateUploadedFiles,
@@ -18,30 +22,107 @@ const AUTH_URL = 'https://auth.example.test';
 const CUSTOMER_ID = '65b000000000000000000001';
 const VENDOR_ID = '65b000000000000000000002';
 const OTHER_VENDOR_ID = '65b000000000000000000003';
+const PREMIUM_VENDOR_ID = '65b000000000000000000004';
+const EXPIRED_VENDOR_ID = '65b000000000000000000005';
+const INACTIVE_STATUS_VENDOR_ID = '65b000000000000000000006';
 const ITEM_ID = '65c000000000000000000001';
 const OTHER_ITEM_ID = '65c000000000000000000002';
 const FIXED_DATE = new Date('2026-01-01T00:00:00.000Z');
+const FUTURE_DATE = new Date('2099-01-01T00:00:00.000Z');
 const IMAGE_URL = 'https://i.ibb.co/test/pizza.png';
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
 const TOKEN_SUBJECTS = Object.freeze({
   'customer-token': CUSTOMER_ID,
   'vendor-token': VENDOR_ID,
+  'premium-token': PREMIUM_VENDOR_ID,
+  'expired-premium-token': EXPIRED_VENDOR_ID,
+  'inactive-status-token': INACTIVE_STATUS_VENDOR_ID,
 });
 
 const users = new Map([
-  [CUSTOMER_ID, { _id: new ObjectId(CUSTOMER_ID), role: 'customer', isBlocked: false }],
-  [VENDOR_ID, { _id: new ObjectId(VENDOR_ID), role: 'vendor', isBlocked: false }],
+  [
+    CUSTOMER_ID,
+    {
+      _id: new ObjectId(CUSTOMER_ID),
+      role: 'customer',
+      isBlocked: false,
+      subscriptionPlan: 'free',
+      subscriptionStatus: 'inactive',
+      subscriptionExpiresAt: null,
+    },
+  ],
+  [
+    VENDOR_ID,
+    {
+      _id: new ObjectId(VENDOR_ID),
+      role: 'vendor',
+      isBlocked: false,
+      subscriptionPlan: 'free',
+      subscriptionStatus: 'inactive',
+      subscriptionExpiresAt: null,
+    },
+  ],
+  [
+    PREMIUM_VENDOR_ID,
+    {
+      _id: new ObjectId(PREMIUM_VENDOR_ID),
+      role: 'vendor',
+      isBlocked: false,
+      subscriptionPlan: 'premium',
+      subscriptionStatus: 'active',
+      subscriptionExpiresAt: FUTURE_DATE,
+    },
+  ],
+  [
+    EXPIRED_VENDOR_ID,
+    {
+      _id: new ObjectId(EXPIRED_VENDOR_ID),
+      role: 'vendor',
+      isBlocked: false,
+      subscriptionPlan: 'premium',
+      subscriptionStatus: 'active',
+      subscriptionExpiresAt: FIXED_DATE,
+    },
+  ],
+  [
+    INACTIVE_STATUS_VENDOR_ID,
+    {
+      _id: new ObjectId(INACTIVE_STATUS_VENDOR_ID),
+      role: 'vendor',
+      isBlocked: false,
+      subscriptionPlan: 'premium',
+      subscriptionStatus: 'inactive',
+      subscriptionExpiresAt: FUTURE_DATE,
+    },
+  ],
 ]);
 
-function matches(filter, item) {
-  return Object.entries(filter ?? {}).every(([key, expected]) => {
-    if (key === '_id') {
-      return String(expected) === String(item._id);
-    }
+function valuesEqual(left, right) {
+  if (left instanceof ObjectId || right instanceof ObjectId) {
+    return String(left) === String(right);
+  }
 
-    return item[key] === expected;
-  });
+  return left === right;
+}
+
+/** Small fake-filter evaluator for the $in/$ne operators used by slot counting. */
+function matchesValue(expected, actual) {
+  if (expected && typeof expected === 'object' && Object.hasOwn(expected, '$in')) {
+    return expected.$in.some((candidate) => valuesEqual(candidate, actual));
+  }
+
+  if (expected && typeof expected === 'object' && Object.hasOwn(expected, '$ne')) {
+    return !valuesEqual(expected.$ne, actual);
+  }
+
+  return valuesEqual(expected, actual);
+}
+
+function matches(filter, item) {
+  return Object.entries(filter ?? {}).every(([key, expected]) =>
+    matchesValue(expected, item[key]),
+  );
 }
 
 function createFakeCollection() {
@@ -179,6 +260,21 @@ function createFakeCollection() {
   return collection;
 }
 
+function seedSlotItems(collection, count, overrides = {}) {
+  return Array.from({ length: count }, () => {
+    const _id = new ObjectId();
+
+    collection.seedItem({
+      _id,
+      status: MENU_STATUS.APPROVED,
+      isAvailable: true,
+      ...overrides,
+    });
+
+    return _id;
+  });
+}
+
 let fakeCollection;
 let uploadCalls = [];
 let failUpload = false;
@@ -221,6 +317,13 @@ function createForm(fields = validFields(), files = [imageBlob()]) {
   }
 
   return form;
+}
+
+function createItem(token, fields = validFields()) {
+  return bearer('/api/menu', token, {
+    method: 'POST',
+    body: createForm(fields),
+  });
 }
 
 function request(path, options = {}) {
@@ -268,7 +371,15 @@ before(async () => {
           throw new Error('invalid test token');
         }
 
-        return { sub: subject };
+        // Deliberately claim Premium in the JWT. authenticate() must ignore
+        // these and use the fake MongoDB user map above instead.
+        return {
+          sub: subject,
+          role: 'vendor',
+          subscriptionPlan: 'premium',
+          subscriptionStatus: 'active',
+          subscriptionExpiresAt: FUTURE_DATE.toISOString(),
+        };
       },
       findUser: async (userId) => users.get(userId) ?? null,
     },
@@ -393,8 +504,130 @@ test('a vendor can create an item with pending status and server-owned fields', 
   assert.equal(uploadCalls.length, 1);
 });
 
+test('a free vendor can create up to three active/reserved items', async () => {
+  for (let index = 0; index < FREE_MENU_ITEM_LIMIT; index += 1) {
+    const response = await createItem(
+      'vendor-token',
+      validFields({ itemName: `Pizza ${index + 1}` }),
+    );
+    const body = await response.json();
+
+    assert.equal(response.status, 201);
+    assert.equal(body.item.status, MENU_STATUS.PENDING);
+    assert.equal(body.item.isAvailable, true);
+  }
+
+  const inserts = fakeCollection.state.calls.filter((call) => call.method === 'insertOne');
+
+  assert.equal(inserts.length, FREE_MENU_ITEM_LIMIT);
+
+  for (const insert of inserts) {
+    assert.equal(insert.document.vendorId, VENDOR_ID);
+    assert.equal(insert.document.status, MENU_STATUS.PENDING);
+    assert.equal(insert.document.isAvailable, true);
+  }
+});
+
+test('a free vendor cannot create a fourth active/reserved item', async () => {
+  fakeCollection.seedItem({ _id: new ObjectId(), status: MENU_STATUS.PENDING });
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT - 1, { status: MENU_STATUS.APPROVED });
+
+  const body = await expectStatus(await createItem('vendor-token'), 409, 'MENU_ITEM_LIMIT_REACHED');
+
+  assert.match(body.message, /Free plan allows 3 active menu items/);
+  assert.equal(uploadCalls.length, 0);
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 0);
+
+  const countCall = fakeCollection.state.calls.find((call) => call.method === 'countDocuments');
+
+  assert.equal(countCall.filter.vendorId, VENDOR_ID);
+  assert.deepEqual(countCall.filter.status, {
+    $in: [MENU_STATUS.PENDING, MENU_STATUS.APPROVED],
+  });
+  assert.deepEqual(countCall.filter.isAvailable, { $ne: false });
+});
+
+test('an active unexpired premium vendor can create more than three items', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT, { vendorId: PREMIUM_VENDOR_ID });
+
+  for (let index = 0; index < 2; index += 1) {
+    const response = await createItem(
+      'premium-token',
+      validFields({ itemName: `Premium Pizza ${index + 1}` }),
+    );
+
+    assert.equal(response.status, 201);
+  }
+
+  const inserts = fakeCollection.state.calls.filter((call) => call.method === 'insertOne');
+
+  assert.equal(inserts.length, 2);
+  assert.equal(uploadCalls.length, 2);
+
+  for (const insert of inserts) {
+    assert.equal(insert.document.vendorId, PREMIUM_VENDOR_ID);
+  }
+
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'countDocuments').length, 0);
+});
+
+test('an expired premium subscription is treated as free', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT, { vendorId: EXPIRED_VENDOR_ID });
+
+  await expectStatus(await createItem('expired-premium-token'), 409, 'MENU_ITEM_LIMIT_REACHED');
+
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 0);
+});
+
+test('a premium subscription without active status is treated as free', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT, {
+    vendorId: INACTIVE_STATUS_VENDOR_ID,
+  });
+
+  await expectStatus(await createItem('inactive-status-token'), 409, 'MENU_ITEM_LIMIT_REACHED');
+
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 0);
+});
+
+test('unavailable items do not consume a free vendor slot', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT - 1);
+  seedSlotItems(fakeCollection, 1, { isAvailable: false });
+
+  const response = await createItem('vendor-token');
+
+  assert.equal(response.status, 201);
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 1);
+});
+
+test('rejected items do not consume a free vendor slot', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT - 1);
+  fakeCollection.seedItem({
+    _id: new ObjectId(),
+    status: MENU_STATUS.REJECTED,
+    isAvailable: true,
+  });
+
+  const response = await createItem('vendor-token');
+  const countCall = fakeCollection.state.calls.find((call) => call.method === 'countDocuments');
+
+  assert.equal(response.status, 201);
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 1);
+  assert.deepEqual(countCall.filter.status, {
+    $in: [MENU_STATUS.PENDING, MENU_STATUS.APPROVED],
+  });
+});
+
 test('client-supplied vendorId, status and images fields are rejected', async () => {
-  for (const field of ['vendorId', 'status', 'images', 'createdAt', 'isAvailable']) {
+  for (const field of [
+    'vendorId',
+    'status',
+    'images',
+    'createdAt',
+    'isAvailable',
+    'subscriptionPlan',
+    'subscriptionStatus',
+    'subscriptionExpiresAt',
+  ]) {
     const response = await bearer('/api/menu', 'vendor-token', {
       method: 'POST',
       body: createForm(validFields({ [field]: 'malicious' })),
@@ -498,7 +731,7 @@ test('ImgBB upload failures are safe and do not leak credentials', async () => {
 
   assert.equal(body.message, 'An unexpected error occurred.');
   assert.ok(!JSON.stringify(body).includes('imgbb-secret-should-not-leak'));
-  assert.equal(fakeCollection.state.calls.length, 0);
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 0);
 });
 
 test('GET /api/menu/mine returns only the authenticated vendor items with pagination', async () => {
@@ -581,7 +814,16 @@ test('a vendor cannot update another vendor item', async () => {
 test('status, vendorId and other reserved fields cannot be patched', async () => {
   fakeCollection.seedItem();
 
-  for (const field of ['status', 'vendorId', 'createdAt', 'images', '_id']) {
+  for (const field of [
+    'status',
+    'vendorId',
+    'createdAt',
+    'images',
+    '_id',
+    'subscriptionPlan',
+    'subscriptionStatus',
+    'subscriptionExpiresAt',
+  ]) {
     const response = await jsonRequest('PATCH', `/api/menu/${ITEM_ID}`, 'vendor-token', {
       [field]: 'malicious',
     });
@@ -631,6 +873,59 @@ test('availability can be toggled only by the owning vendor', async () => {
     assert.equal(filter.vendorId, VENDOR_ID);
     assert.equal(String(filter._id), ITEM_ID);
   }
+});
+
+test('reactivating an item is blocked when the free limit is already reached', async () => {
+  seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT);
+  const targetId = new ObjectId(OTHER_ITEM_ID);
+  fakeCollection.seedItem({ _id: targetId, isAvailable: false });
+
+  const body = await expectStatus(
+    await bearer(`/api/menu/${targetId}/availability`, 'vendor-token', { method: 'PATCH' }),
+    409,
+    'MENU_ITEM_LIMIT_REACHED',
+  );
+
+  assert.match(body.message, /Free plan allows 3 active menu items/);
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'updateOne').length, 0);
+  assert.equal(
+    fakeCollection.state.items.find((item) => String(item._id) === String(targetId)).isAvailable,
+    false,
+  );
+
+  const countCall = fakeCollection.state.calls.find((call) => call.method === 'countDocuments');
+  assert.equal(String(countCall.filter._id.$ne), String(targetId));
+});
+
+test('general PATCH cannot change availability or bypass the slot limit', async () => {
+  const [ownedId] = seedSlotItems(fakeCollection, FREE_MENU_ITEM_LIMIT);
+
+  await expectStatus(
+    await jsonRequest('PATCH', `/api/menu/${ownedId}`, 'vendor-token', { isAvailable: false }),
+    400,
+    'FORBIDDEN_FIELD',
+  );
+
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'updateOne').length, 0);
+  await expectStatus(await createItem('vendor-token'), 409, 'MENU_ITEM_LIMIT_REACHED');
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'insertOne').length, 0);
+});
+
+test('a premium vendor cannot reactivate another vendor item', async () => {
+  const targetId = new ObjectId(OTHER_ITEM_ID);
+  fakeCollection.seedItem({ _id: targetId, vendorId: VENDOR_ID, isAvailable: false });
+
+  await expectStatus(
+    await bearer(`/api/menu/${targetId}/availability`, 'premium-token', { method: 'PATCH' }),
+    404,
+    'MENU_ITEM_NOT_FOUND',
+  );
+
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'updateOne').length, 0);
+  assert.equal(
+    fakeCollection.state.items.find((item) => String(item._id) === String(targetId)).isAvailable,
+    false,
+  );
 });
 
 test('a vendor cannot toggle or delete another vendor item', async () => {

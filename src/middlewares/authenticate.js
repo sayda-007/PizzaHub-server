@@ -16,6 +16,7 @@ export const SAFE_USER_FIELDS = Object.freeze([
   'role',
   'businessName',
   'subscriptionPlan',
+  'subscriptionStatus',
   'subscriptionExpiresAt',
 ]);
 
@@ -29,6 +30,7 @@ const USER_LOOKUP_PROJECTION = Object.freeze({
   businessName: 1,
   isBlocked: 1,
   subscriptionPlan: 1,
+  subscriptionStatus: 1,
   subscriptionExpiresAt: 1,
 });
 

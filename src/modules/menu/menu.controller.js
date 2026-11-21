@@ -1,3 +1,4 @@
+import { validateUploadedFiles } from '../../services/imgbb.js';
 import { ApiError } from '../../utils/api-error.js';
 import { validateMenuCreate } from './menu.validator.js';
 
@@ -9,27 +10,42 @@ import { validateMenuCreate } from './menu.validator.js';
  * controller only reads req.user.id and never trusts a client-supplied id.
  */
 export function createMenuController(service, imageUploader) {
-  function currentVendorId(req) {
-    const id = req.user?.id;
+  /**
+   * `authenticate` fills req.user from the MongoDB user record, so this object
+   * carries the current server-owned subscription state. JWT claims are ignored.
+   */
+  function currentVendor(req) {
+    const user = req.user;
 
-    if (typeof id !== 'string' || id.trim() === '') {
+    if (!user || typeof user.id !== 'string' || user.id.trim() === '') {
       throw ApiError.unauthorized('Authentication required.', 'UNAUTHORIZED');
     }
 
-    return id;
+    return user;
   }
 
   return {
     async create(req, res, next) {
       try {
-        const vendorId = currentVendorId(req);
+        const vendor = currentVendor(req);
+        const vendorId = vendor.id;
         const validatedData = validateMenuCreate(req.body);
 
-        // Upload only after the text fields are valid. The uploader validates
-        // file type/size/count and returns only ImgBB's direct image URLs.
+        // Reject bad files before any database or ImgBB work. The uploader
+        // repeats this check when it builds the ImgBB request.
+        validateUploadedFiles(req.files ?? []);
+
+        // Check the DB-backed subscription before spending an ImgBB upload.
+        // The service repeats the check so the database boundary stays safe.
+        if (typeof service.assertCanCreate === 'function') {
+          await service.assertCanCreate(vendorId, vendor);
+        }
+
+        // Upload only after the text fields and slot limit are valid. The
+        // uploader validates file type/size/count and returns only ImgBB URLs.
         const imageUrls = await imageUploader.uploadImages(req.files ?? []);
 
-        const item = await service.create(vendorId, validatedData, imageUrls);
+        const item = await service.create(vendorId, validatedData, imageUrls, vendor);
 
         return res.status(201).json({ item });
       } catch (error) {
@@ -39,7 +55,7 @@ export function createMenuController(service, imageUploader) {
 
     async listMine(req, res, next) {
       try {
-        const vendorId = currentVendorId(req);
+        const vendorId = currentVendor(req).id;
         const result = await service.listMine(vendorId, req.query);
 
         return res.json(result);
@@ -50,7 +66,7 @@ export function createMenuController(service, imageUploader) {
 
     async update(req, res, next) {
       try {
-        const vendorId = currentVendorId(req);
+        const vendorId = currentVendor(req).id;
         const item = await service.update(vendorId, req.params.id, req.body);
 
         return res.json({ item });
@@ -61,8 +77,8 @@ export function createMenuController(service, imageUploader) {
 
     async toggleAvailability(req, res, next) {
       try {
-        const vendorId = currentVendorId(req);
-        const item = await service.toggleAvailability(vendorId, req.params.id);
+        const vendor = currentVendor(req);
+        const item = await service.toggleAvailability(vendor.id, req.params.id, vendor);
 
         return res.json({ item });
       } catch (error) {
@@ -72,7 +88,7 @@ export function createMenuController(service, imageUploader) {
 
     async remove(req, res, next) {
       try {
-        const vendorId = currentVendorId(req);
+        const vendorId = currentVendor(req).id;
         await service.remove(vendorId, req.params.id);
 
         return res.status(204).end();

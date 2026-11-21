@@ -29,6 +29,9 @@ const CREATE_RESERVED_FIELDS = new Set([
   'createdAt',
   'updatedAt',
   'isAvailable',
+  'subscriptionPlan',
+  'subscriptionStatus',
+  'subscriptionExpiresAt',
   'id',
   '_id',
 ]);
@@ -40,6 +43,9 @@ const UPDATE_RESERVED_FIELDS = new Set([
   'createdAt',
   'updatedAt',
   'isAvailable',
+  'subscriptionPlan',
+  'subscriptionStatus',
+  'subscriptionExpiresAt',
   'id',
   '_id',
 ]);

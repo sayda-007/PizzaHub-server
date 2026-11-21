@@ -14,6 +14,7 @@ const RESERVED_PROFILE_FIELDS = new Set([
   'role',
   'isBlocked',
   'subscriptionPlan',
+  'subscriptionStatus',
   'subscriptionExpiresAt',
   'email',
   'emailVerified',

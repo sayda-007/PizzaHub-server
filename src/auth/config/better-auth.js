@@ -24,6 +24,17 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
   PREMIUM: 'premium',
 });
 
+/**
+ * Stripe webhooks will own these values later. Only `active` grants Premium
+ * access, and the expiration date must still be in the future as well.
+ */
+export const SUBSCRIPTION_STATUS = Object.freeze({
+  ACTIVE: 'active',
+  INACTIVE: 'inactive',
+  PAST_DUE: 'past_due',
+  CANCELED: 'canceled',
+});
+
 const MIN_PASSWORD_LENGTH = 6;
 const MAX_PASSWORD_LENGTH = 128;
 
@@ -35,6 +46,7 @@ const SERVER_OWNED_USER_FIELDS = Object.freeze([
   'role',
   'isBlocked',
   'subscriptionPlan',
+  'subscriptionStatus',
   'subscriptionExpiresAt',
 ]);
 
@@ -42,6 +54,7 @@ const SERVER_OWNED_USER_FIELDS = Object.freeze([
 const REGISTRATION_RESERVED_FIELDS = Object.freeze([
   'isBlocked',
   'subscriptionPlan',
+  'subscriptionStatus',
   'subscriptionExpiresAt',
 ]);
 
@@ -208,6 +221,12 @@ export function createAuth(env, options = {}) {
           defaultValue: SUBSCRIPTION_PLANS.FREE,
           input: false,
         },
+        subscriptionStatus: {
+          type: Object.values(SUBSCRIPTION_STATUS),
+          required: false,
+          defaultValue: SUBSCRIPTION_STATUS.INACTIVE,
+          input: false,
+        },
         subscriptionExpiresAt: {
           type: 'date',
           required: false,
@@ -227,6 +246,7 @@ export function createAuth(env, options = {}) {
               role: resolveRegistrationRole(user.role, context, { allowAdminCreation }),
               isBlocked: false,
               subscriptionPlan: SUBSCRIPTION_PLANS.FREE,
+              subscriptionStatus: SUBSCRIPTION_STATUS.INACTIVE,
               subscriptionExpiresAt: null,
               businessName: sanitizeBusinessName(user.businessName),
             },
