@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, Admin menu moderation, and customer/vendor order management are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Admin dashboard/user APIs and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, Admin menu moderation, customer/vendor order management, and Stripe Premium subscriptions with verified webhooks are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Admin dashboard/user APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -45,12 +45,13 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Customer order placement, owned listing/details, and pending-order cancellation
 - Vendor order listing and single-use accept/reject decisions
 - Atomic duplicate-active-order protection with a unique partial MongoDB index
+- Stripe Checkout subscriptions using the official SDK, signed webhooks and idempotent state updates
+- Period-end cancellation, Premium expiry, payment transactions and menu-slot synchronization
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
 - Admin dashboard and user management
-- Stripe premium subscription checkout and verified webhooks
 - Integration tests and deployment documentation
 
 ## Technology stack
@@ -64,7 +65,7 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | Auth | Better Auth 1.7 with the official MongoDB adapter and JWT plugin |
 | JWT verification | `jose` (`createRemoteJWKSet` + `jwtVerify`) |
 | Image uploads | Multer memory storage + ImgBB API v1 with built-in `fetch` |
-| Payments | Stripe Checkout + webhooks (from Milestone 13) |
+| Payments | Official Stripe SDK: Checkout Sessions, subscriptions and signed webhooks |
 | Validation | Zod |
 
 ## Important npm packages
@@ -81,8 +82,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | `@better-auth/mongo-adapter` | Official adapter that reuses the existing `Db` and `MongoClient` |
 | `jose` | Remote JWKS resolution and JWT signature/claim verification |
 | `multer` | Parses multipart image uploads into memory for ImgBB |
+| `stripe` | Official Stripe SDK for Checkout, subscriptions and webhook signature verification |
 
-Ten runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest. ImgBB uses built-in `fetch`, `FormData` and `Blob`, so no HTTP client package was added.
+Eleven runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest. ImgBB uses built-in `fetch`, `FormData` and `Blob`, so no HTTP client package was added.
 
 ## Project structure
 
@@ -114,7 +116,8 @@ server/
     ├── utils/
     │   └── api-error.js               # ApiError class + status helpers
     ├── services/
-    │   └── imgbb.js                   # Multer limits + ImgBB upload client
+    │   ├── imgbb.js                   # Multer limits + ImgBB upload client
+    │   └── stripe.js                  # server-only Stripe config + official SDK client
     ├── scripts/
     │   └── seed-admin.js              # manual Admin seed via Better Auth
     ├── tests/
@@ -126,7 +129,8 @@ server/
     │   ├── menu.test.js               # vendor menu API with fake collections
     │   ├── admin-menu.test.js         # admin moderation API with fake collections
     │   ├── order.test.js              # customer/vendor order APIs with fakes
-    │   └── indexes.test.js            # safe index error-message tests
+    │   ├── indexes.test.js            # safe index error-message tests
+    │   └── subscription.test.js       # fake Stripe subscription/webhook tests
     └── modules/
         ├── admin/
         │   ├── admin-menu.routes.js   # authenticated admin-only routing
@@ -145,14 +149,19 @@ server/
         │   ├── menu.controller.js     # request/response handling
         │   ├── menu.service.js        # ownership-aware MongoDB queries
         │   └── menu.validator.js      # Zod body, public query and pagination validation
-        └── order/
-            ├── order.routes.js        # customer and vendor role-scoped routers
-            ├── order.controller.js    # request/response handling
-            ├── order.service.js       # snapshots, ownership and atomic writes
-            └── order.validator.js     # Zod body, query and date validation
+        ├── order/
+        │   ├── order.routes.js        # customer and vendor role-scoped routers
+        │   ├── order.controller.js    # request/response handling
+        │   ├── order.service.js       # snapshots, ownership and atomic writes
+        │   └── order.validator.js     # Zod body, query and date validation
+        └── payment/
+            ├── payment.routes.js      # vendor routes + raw webhook router
+            ├── payment.controller.js  # request handling + signature verification
+            ├── payment.service.js     # Stripe calls, webhooks and idempotent writes
+            └── payment.validator.js   # strict no-input body validation
 ```
 
-Planned folders: `modules/{browse,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folder: `modules/browse/`. It will be added in the milestone that uses it so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -205,7 +214,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 
 ## Collections and indexes
 
-`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. Better Auth also owns `session`, `account`, `verification` and `jwks`. Tests use in-memory or injected fake stores and insert no Atlas records; the only code that creates an Admin is the explicit `npm run seed:admin` command.
+`src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getUsersCollection()`, `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all four share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. The subscription module only reads and conditionally updates those Better Auth records. Better Auth also owns `session`, `account`, `verification` and `jwks`. Tests use in-memory or injected fake stores and insert no Atlas records; the only code that creates an Admin is the explicit `npm run seed:admin` command.
 
 `src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`. Unique-index failures name the index and explain that no data was changed and the conflicting documents must be resolved manually before restarting; startup does not continue without the duplicate guard.
 
@@ -235,6 +244,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 | --- | --- |
 | `{ stripeSessionId: 1 }` (unique, sparse) | Webhook idempotency. Safe because Stripe generates and owns this immutable value; `sparse` prevents incomplete records from colliding. |
 | `{ stripeSubscriptionId: 1 }` | Find records for one subscription when handling cancellation/expiration. |
+| `{ stripeInvoiceId: 1 }` (unique, sparse) | Atomic duplicate guard for paid/failed webhook deliveries; immutable Stripe invoice ids only. |
 | `{ vendorId: 1, createdAt: -1 }` | Vendor's payment history, newest first. |
 | `{ status: 1, createdAt: -1 }` | Admin filtering by payment status. |
 | `{ createdAt: -1 }` | Admin listing of all transactions, newest first. |
@@ -253,10 +263,11 @@ Order writes use the existing `orders` collection only. The new unique partial i
 2. **CORS** — environment-driven origin whitelist. It runs early so CORS headers are also present on error responses.
 3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
 4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
-5. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
-6. **Feature routers** — currently `/api/health`, `/api/users`, `/api/menu` and `/api/admin/menu`; later modules mount under `/api`.
-7. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
-8. **Error handler** — always last, so it catches errors from every earlier layer.
+5. **Stripe webhook** — `POST /api/webhooks/stripe` uses `express.raw({ type: 'application/json' })` before the global JSON parser. Stripe signs exact bytes, so the signature is verified against the raw buffer.
+6. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
+7. **Feature routers** — currently `/api/health`, `/api/users`, `/api/menu`, `/api/admin/menu`, `/api/orders`, `/api/vendor/orders` and `/api/vendor/subscription`.
+8. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
+9. **Error handler** — always last, so it catches errors from every earlier layer.
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
@@ -318,8 +329,12 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `PATCH` | `/api/orders/:id/cancel` | Bearer JWT + Customer | Cancels the customer's own pending order |
 | `GET` | `/api/vendor/orders` | Bearer JWT + Vendor | Lists only the vendor's own orders, optionally by status |
 | `PATCH` | `/api/vendor/orders/:id/status` | Bearer JWT + Vendor | Accepts or rejects one of the vendor's own pending orders |
+| `POST` | `/api/vendor/subscription/checkout` | Bearer JWT + Vendor | Creates a Stripe Checkout Session for Premium |
+| `GET` | `/api/vendor/subscription` | Bearer JWT + Vendor | Returns the current safe subscription status |
+| `POST` | `/api/vendor/subscription/cancel` | Bearer JWT + Vendor | Cancels at the current Stripe period end |
+| `POST` | `/api/webhooks/stripe` | Public, signed | Verifies Stripe signatures and synchronizes Premium state |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing), `/api/admin/menu/*`, `/api/orders/*` and `/api/vendor/orders/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing), `/api/admin/menu/*`, `/api/orders/*`, `/api/vendor/orders/*` and `/api/vendor/subscription/*` use the JWT middleware instead of auth cookies. `/api/webhooks/stripe` is public by design but is never trusted without a valid Stripe signature. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -334,15 +349,15 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 | `CLIENT_URL` | **Milestone 5 — required** | Trusted browser origin for the future Next.js client |
 | `GOOGLE_CLIENT_ID` | Milestone 5 — optional | OAuth credential; both Google variables must be real or both unset |
 | `GOOGLE_CLIENT_SECRET` | Milestone 5 — optional | OAuth credential, server-side only |
-| `STRIPE_SECRET_KEY` | Milestone 13 | Test-mode key during development |
-| `STRIPE_WEBHOOK_SECRET` | Milestone 13 | Verifies webhook signatures |
-| `STRIPE_PRICE_ID` | Milestone 13 | Premium plan price |
+| `STRIPE_SECRET_KEY` | Premium subscriptions | Required with the other two Stripe values; server-side only |
+| `STRIPE_WEBHOOK_SECRET` | Premium subscriptions | Verifies raw webhook signatures; server-side only |
+| `STRIPE_PREMIUM_PRICE_ID` | Premium subscriptions | Server-owned Premium price; never accepted from a client |
 | `IMGBB_API_KEY` | Vendor menu uploads | Optional at startup; required when a menu image is uploaded; placeholders are rejected |
 | `ADMIN_NAME` | Admin seed script | Required only when running `npm run seed:admin`; placeholders are rejected |
 | `ADMIN_EMAIL` | Admin seed script | Real address required; `example.com`/`example.test` placeholders are rejected |
 | `ADMIN_PASSWORD` | Admin seed script | 6–128 characters with at least one uppercase and one lowercase letter |
 
-`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in is disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them. `IMGBB_API_KEY` is also optional at startup so the server can run without uploads, but a menu image upload returns a safe error until a real key is configured.
+`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in is disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three Stripe values follow the same safe rule: all missing/placeholder values disable Premium subscriptions with a warning, while a partial real configuration is a startup error. `CLIENT_URL` supplies the Checkout success/cancel origins. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them. `IMGBB_API_KEY` is also optional at startup so the server can run without uploads, but a menu image upload returns a safe error until a real key is configured.
 
 ## Authentication architecture
 
@@ -489,7 +504,7 @@ A slot is used only by an item that is available and has a slot-consuming status
 
 The limit is checked before `POST /api/menu` uploads images and again in the menu service. `PATCH /api/menu/:id/availability` also checks the limit when an unavailable item is being made available again. A blocked request returns `409 MENU_ITEM_LIMIT_REACHED`; no upload is spent and no menu document is written. General `PATCH /api/menu/:id` cannot change availability, status or subscription fields, so it cannot bypass the limit.
 
-These fields are server-owned and will be updated by the later Stripe webhook milestone. They cannot be set by registration, profile updates or menu requests, and JWT subscription claims are ignored.
+These fields are server-owned and are updated only by verified Stripe webhooks. They cannot be set by registration, profile updates, subscription requests or menu requests, and JWT subscription claims are ignored.
 
 ### Request rules
 
@@ -596,6 +611,40 @@ Both single-order and cancellation responses use `{ "order": … }`; list respon
 The service rejects a second `pending` or `accepted` order from the same customer for the same item and delivery date with `409 ORDER_ALREADY_ACTIVE`. The fast pre-check gives a readable response for the common case, while a unique partial MongoDB index on `activeOrderKey` is the atomic guard for concurrent requests. The server sets `activeOrderKey` only while an order is active and unsets it on customer cancellation or vendor rejection, so the customer may order again for that date after either outcome. A MongoDB duplicate-key race is translated into the same clean `409`; no record is deleted.
 
 The original non-unique `{ itemId: 1, customerId: 1, deliveryDate: 1 }` index is retained unchanged. If existing data prevents the unique index from being created, startup stops with a sanitized message naming the index and requiring manual conflict resolution; no records are modified. Legacy active orders created without `activeOrderKey` remain covered by the service check, but atomic protection applies only after the unique index has been created successfully.
+
+## Stripe Premium subscriptions
+
+The four files in `src/modules/payment/` and `src/services/stripe.js` implement Premium with the official `stripe` SDK. No pizza order is charged; Stripe is used only for the vendor subscription. Customers do not need a Stripe account, and no client can choose a price, plan, price id, customer id or subscription id.
+
+### Configuration and checkout
+
+All three Stripe variables must be real together, or all must be missing/placeholder. `CLIENT_URL` is the trusted redirect origin; the server appends `/subscription/success?session_id={CHECKOUT_SESSION_ID}` and `/subscription/cancel`. A partial configuration is a startup error, and incomplete runtime configuration returns a safe `503 PAYMENT_UNAVAILABLE`. Secret values are never logged or returned.
+
+`POST /api/vendor/subscription/checkout` and `POST /api/vendor/subscription/cancel` accept no body; unknown or server-owned fields get `400 VALIDATION_ERROR`/`FORBIDDEN_FIELD`. Checkout:
+
+1. Loads the vendor from MongoDB; role and identity come from the verified JWT and the database record, never from the body.
+2. Rejects an already-active Premium vendor with `409 SUBSCRIPTION_ALREADY_ACTIVE`.
+3. Reuses a stored Stripe customer id or creates one with a stable idempotency key, then stores that id with a conditional update.
+4. Creates a `subscription` Checkout Session using only `STRIPE_PREMIUM_PRICE_ID`, with the vendor id in `client_reference_id`, session metadata and `subscription_data.metadata`. A daily stable idempotency key protects against duplicate submissions.
+5. Returns only `{ checkoutUrl, sessionId }`.
+
+`GET /api/vendor/subscription` returns `{ subscription }` with `plan`, `status`, `expiresAt`, `cancelAtPeriodEnd` and a computed `isPremium`. Stripe ids and private user fields are excluded. Premium access still requires **all three** MongoDB conditions: `subscriptionPlan: 'premium'`, `subscriptionStatus: 'active'` and a future `subscriptionExpiresAt`. JWT subscription claims are ignored.
+
+### Webhooks, idempotency and cancellation
+
+`POST /api/webhooks/stripe` is mounted before `express.json()` and uses `express.raw({ type: 'application/json' })`. `stripe.webhooks.constructEvent()` verifies the exact raw bytes with the `Stripe-Signature` header and `STRIPE_WEBHOOK_SECRET`; missing or invalid signatures return `400 INVALID_STRIPE_SIGNATURE`. Unknown event types are acknowledged and ignored. Handled events are:
+
+- `checkout.session.completed` — stores the subscription id, fetches the subscription with the SDK and activates Premium.
+- `invoice.paid` — activates Premium and records a paid transaction.
+- `invoice.payment_failed` — records a failed transaction and moves the user to `past_due`, which removes Premium access.
+- `customer.subscription.updated` — synchronizes status, expiry and `cancel_at_period_end`.
+- `customer.subscription.deleted` — revokes Premium and clears the expiry.
+
+Vendor identity is taken from the server-written metadata first and then from stored Stripe customer/subscription ids. A mismatch returns a safe `400 STRIPE_VENDOR_MISMATCH`, and an unknown vendor returns `400 STRIPE_VENDOR_NOT_FOUND`; neither writes state. Each user stores the Stripe event time, priority, type and id. Conditional MongoDB updates reject older or equal-but-lower-priority events, so retries and out-of-order deliveries cannot roll back newer state. Transactions are upserted by immutable Stripe session/invoice ids; the unique sparse invoice index and duplicate-key handling prevent duplicate records, and stale events cannot overwrite newer payment statuses.
+
+`POST /api/vendor/subscription/cancel` calls `subscriptions.update(id, { cancel_at_period_end: true })` with a stable idempotency key and stores the same flag on the user. Premium remains active until the stored expiry time; the endpoint never deletes data. A vendor with no linked subscription gets `404 SUBSCRIPTION_NOT_FOUND`; if Stripe reports that the linked subscription no longer exists, the local record is marked canceled. Transactions include only `vendorId`, Stripe identifiers, `amount`, `currency`, `paymentStatus`/`status`, timestamps and event metadata — no card, CVC or panel data.
+
+Tests use in-memory collections plus an injected fake Stripe API. Webhook signature tests use the SDK's own test-header helper with fake local secrets; no real payment, Atlas record, ImgBB call or external request is made.
 
 ## Admin seed script
 

@@ -14,6 +14,10 @@ import {
   createCustomerOrderRoutes,
   createVendorOrderRoutes,
 } from './modules/order/order.routes.js';
+import {
+  createStripeWebhookRoutes,
+  createVendorSubscriptionRoutes,
+} from './modules/payment/payment.routes.js';
 import { createUserRoutes } from './modules/user/user.routes.js';
 
 /**
@@ -22,13 +26,13 @@ import { createUserRoutes } from './modules/user/user.routes.js';
  * isolated instance later without starting a real network listener.
  *
  * Middleware order matters:
- * security headers -> CORS -> rate limit -> Better Auth handler -> body parsing
- * -> routes -> 404 -> error handler (must be last).
+ * security headers -> CORS -> rate limit -> Better Auth handler -> Stripe
+ * webhook (raw body) -> express.json() -> routes -> 404 -> error handler.
  *
- * Better Auth must see the raw request stream, so it is mounted before
- * express.json(). Express 5 uses the named wildcard `*splat`.
+ * Better Auth and Stripe webhooks must see the raw request stream, so both are
+ * mounted before express.json(). Express 5 uses the named wildcard `*splat`.
  */
-export function createApp(env) {
+export function createApp(env, dependencies = {}) {
   const app = express();
 
   // Sets security-related HTTP headers (X-Content-Type-Options, HSTS, etc.).
@@ -60,6 +64,12 @@ export function createApp(env) {
   const auth = createAuth(env);
   app.all('/api/auth/*splat', toNodeHandler(auth));
 
+  const paymentDependencies = dependencies.paymentDependencies ?? dependencies;
+
+  // Stripe signs the exact bytes it sends. This route must therefore run before
+  // express.json(); reconstructing a body from parsed JSON can break signatures.
+  app.use('/api/webhooks/stripe', createStripeWebhookRoutes(env, paymentDependencies));
+
   app.use(express.json({ limit: '1mb' }));
 
   // Feature routers are mounted under /api. More modules arrive in later
@@ -70,6 +80,10 @@ export function createApp(env) {
   app.use('/api/admin/menu', createAdminMenuRoutes(env));
   app.use('/api/orders', createCustomerOrderRoutes(env));
   app.use('/api/vendor/orders', createVendorOrderRoutes(env));
+  app.use(
+    '/api/vendor/subscription',
+    createVendorSubscriptionRoutes(env, paymentDependencies),
+  );
 
   app.use(notFound);
   app.use(createErrorHandler(env));

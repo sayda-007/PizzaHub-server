@@ -4,9 +4,9 @@ import { z } from 'zod';
  * Single source of truth for environment configuration.
  *
  * Every variable from .env.example is declared here so the whole team can see
- * what the server expects. Variables for features that are not implemented yet
- * are optional on purpose; they will become required in the milestone that
- * introduces the feature. This lets the project grow without breaking startup.
+ * what the server expects. Optional integrations are validated as a group:
+ * missing/placeholder values disable them, while a partial real configuration
+ * is rejected at startup.
  */
 
 /** Values copied straight from an example file must never be used as credentials. */
@@ -45,10 +45,22 @@ const envSchema = z
     GOOGLE_CLIENT_ID: z.string().trim().min(1).optional(),
     GOOGLE_CLIENT_SECRET: z.string().trim().min(1).optional(),
 
-    // --- Stripe subscriptions (Milestone 13) -------------------------------
-    STRIPE_SECRET_KEY: z.string().trim().min(1).optional(),
-    STRIPE_WEBHOOK_SECRET: z.string().trim().min(1).optional(),
-    STRIPE_PRICE_ID: z.string().trim().min(1).optional(),
+    // --- Stripe subscriptions ---------------------------------------------
+    STRIPE_SECRET_KEY: z
+      .string()
+      .trim()
+      .regex(/^sk_(test|live)_/, 'STRIPE_SECRET_KEY must be a Stripe secret key.')
+      .optional(),
+    STRIPE_WEBHOOK_SECRET: z
+      .string()
+      .trim()
+      .regex(/^whsec_/, 'STRIPE_WEBHOOK_SECRET must be a Stripe webhook secret.')
+      .optional(),
+    STRIPE_PREMIUM_PRICE_ID: z
+      .string()
+      .trim()
+      .regex(/^price_/, 'STRIPE_PREMIUM_PRICE_ID must be a Stripe price id.')
+      .optional(),
 
     // --- ImgBB uploads (Milestone 7) ---------------------------------------
     IMGBB_API_KEY: z.string().trim().min(1).optional(),
@@ -65,6 +77,21 @@ const envSchema = z
     {
       path: ['GOOGLE_CLIENT_ID'],
       message: 'GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET must be supplied together.',
+    },
+  )
+  .refine(
+    (data) => {
+      const configured = [
+        data.STRIPE_SECRET_KEY,
+        data.STRIPE_WEBHOOK_SECRET,
+        data.STRIPE_PREMIUM_PRICE_ID,
+      ].filter(Boolean).length;
+
+      return configured === 0 || configured === 3;
+    },
+    {
+      path: ['STRIPE_SECRET_KEY'],
+      message: 'STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET and STRIPE_PREMIUM_PRICE_ID must be supplied together.',
     },
   );
 
@@ -91,6 +118,25 @@ export function loadEnv() {
 
   if (ignored.length > 0) {
     console.warn('[config] Placeholder or empty Google credentials were ignored; Google sign-in is disabled.');
+  }
+
+  const ignoredStripe = [];
+
+  for (const name of [
+    'STRIPE_SECRET_KEY',
+    'STRIPE_WEBHOOK_SECRET',
+    'STRIPE_PREMIUM_PRICE_ID',
+  ]) {
+    const value = input[name];
+
+    if (typeof value !== 'string' || value.trim() === '' || isPlaceholderCredential(value.trim())) {
+      delete input[name];
+      ignoredStripe.push(name);
+    }
+  }
+
+  if (ignoredStripe.length > 0) {
+    console.warn('[config] Placeholder or empty Stripe settings were ignored; Premium subscriptions are disabled.');
   }
 
   const result = envSchema.safeParse(input);

@@ -96,6 +96,15 @@ const INDEX_DEFINITIONS = Object.freeze([
       // Find all records belonging to one subscription (cancel/expire events).
       { name: 'stripeSubscriptionId_1', key: { stripeSubscriptionId: 1 } },
 
+      // Stripe invoices are immutable. This unique sparse index is the atomic
+      // guard against duplicate paid/failed transaction records when a webhook
+      // is retried or delivered twice. Sparse so non-invoice rows do not clash.
+      {
+        name: 'stripeInvoiceId_1',
+        key: { stripeInvoiceId: 1 },
+        options: { unique: true, sparse: true },
+      },
+
       // Vendor's payment history, newest first.
       { name: 'vendorId_1_createdAt_-1', key: { vendorId: 1, createdAt: -1 } },
 
