@@ -819,8 +819,12 @@ test('invalid ObjectIds are rejected and nonexistent items return 404', async ()
   );
 });
 
-test('an admin can delete any menu item', async () => {
+test('an admin can delete any menu item without affecting unrelated records', async () => {
   const target = fakeCollection.seedItem({ _id: new ObjectId(ITEM_ID) });
+  const unrelated = fakeCollection.seedItem({
+    _id: new ObjectId(),
+    itemName: 'Keep Me',
+  });
 
   const response = await bearer(
     `/api/admin/menu/${ITEM_ID}`,
@@ -829,7 +833,10 @@ test('an admin can delete any menu item', async () => {
   );
 
   assert.equal(response.status, 204);
-  assert.equal(fakeCollection.state.items.length, 0);
+  assert.deepEqual(
+    fakeCollection.state.items.map((item) => String(item._id)),
+    [String(unrelated._id)],
+  );
 
   const deleteCall = fakeCollection.state.calls.find((call) => call.method === 'deleteOne');
 

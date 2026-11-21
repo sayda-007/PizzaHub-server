@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, and Admin menu moderation are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, Admin menu moderation, and customer/vendor order management are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Admin dashboard/user APIs and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -42,11 +42,13 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Ownership checks inside every MongoDB menu query
 - Server-side Free/Premium menu item limits with pending items reserving slots
 - Admin-only menu listing, approval, rejection and deletion
+- Customer order placement, owned listing/details, and pending-order cancellation
+- Vendor order listing and single-use accept/reject decisions
+- Atomic duplicate-active-order protection with a unique partial MongoDB index
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
-- Customer and vendor order workflows
 - Admin dashboard and user management
 - Stripe premium subscription checkout and verified webhooks
 - Integration tests and deployment documentation
@@ -122,7 +124,9 @@ server/
     │   ├── seed-admin.test.js         # seed tests with mocks + in-memory auth
     │   ├── imgbb.test.js              # upload validation with injected fetch
     │   ├── menu.test.js               # vendor menu API with fake collections
-    │   └── admin-menu.test.js         # admin moderation API with fake collections
+    │   ├── admin-menu.test.js         # admin moderation API with fake collections
+    │   ├── order.test.js              # customer/vendor order APIs with fakes
+    │   └── indexes.test.js            # safe index error-message tests
     └── modules/
         ├── admin/
         │   ├── admin-menu.routes.js   # authenticated admin-only routing
@@ -136,14 +140,19 @@ server/
         │   ├── user.controller.js     # Express handlers and safe JSON
         │   ├── user.service.js        # explicit $set updates + reload
         │   └── user.validator.js      # Zod profile validation
-        └── menu/
-            ├── menu.routes.js         # vendor-only routing + scoped Multer
-            ├── menu.controller.js     # request/response handling
-            ├── menu.service.js        # ownership-aware MongoDB queries
-            └── menu.validator.js      # Zod body, public query and pagination validation
+        ├── menu/
+        │   ├── menu.routes.js         # vendor-only routing + scoped Multer
+        │   ├── menu.controller.js     # request/response handling
+        │   ├── menu.service.js        # ownership-aware MongoDB queries
+        │   └── menu.validator.js      # Zod body, public query and pagination validation
+        └── order/
+            ├── order.routes.js        # customer and vendor role-scoped routers
+            ├── order.controller.js    # request/response handling
+            ├── order.service.js       # snapshots, ownership and atomic writes
+            └── order.validator.js     # Zod body, query and date validation
 ```
 
-Planned folders: `modules/{browse,order,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `modules/{browse,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -198,7 +207,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 
 `src/database/collections.js` centralizes the names in `COLLECTIONS` and exposes `getMenuItemsCollection()`, `getOrdersCollection()` and `getTransactionsCollection()`. Each accessor calls `getDb()`, so all three share the single connection pool. `users` is the collection Better Auth uses for its `user` model (`user.modelName: "users"`); no competing user collection or custom user model exists. Better Auth also owns `session`, `account`, `verification` and `jwks`. Tests use in-memory or injected fake stores and insert no Atlas records; the only code that creates an Admin is the explicit `npm run seed:admin` command.
 
-`src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`.
+`src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`. Unique-index failures name the index and explain that no data was changed and the conflicting documents must be resolved manually before restarting; startup does not continue without the duplicate guard.
 
 ### `menuItems`
 
@@ -216,7 +225,8 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 | --- | --- |
 | `{ customerId: 1, createdAt: -1 }` | Customer's own orders, newest first. |
 | `{ vendorId: 1, status: 1, createdAt: -1 }` | Vendor's incoming orders filtered by status. |
-| `{ itemId: 1, customerId: 1, deliveryDate: 1 }` | Duplicate active-order check. Deliberately **not** unique, because rejected/cancelled orders may be recreated. |
+| `{ itemId: 1, customerId: 1, deliveryDate: 1 }` | Original duplicate-check index. Deliberately **not** unique and deliberately retained; rejected/cancelled orders may be recreated and existing deployments keep this index. |
+| `{ activeOrderKey: 1 }` (unique, partial: `{ activeOrderKey: { $exists: true } }`) | Atomic duplicate-active-order guard. The server sets this key only while an order is pending or accepted and unsets it on rejection or cancellation. |
 | `{ deliveryDate: 1 }` | Delivery-date scheduling lookups. |
 
 ### `transactions`
@@ -232,6 +242,8 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 `isAvailable` is a vendor-controlled boolean. Its old compound indexes were from a different design and are still removed: initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched. Vendor listing uses the existing `{ vendorId: 1, createdAt: -1 }` index, and public browsing reuses the status/category/location indexes above.
 
 Public search uses an escaped regular expression against `itemName` and `description`, so no text index is created. Price sorting is performed by MongoDB with the existing status prefix as the starting filter; no dedicated price index is added speculatively. The `_id` index is provided automatically by MongoDB.
+
+Order writes use the existing `orders` collection only. The new unique partial index is additive: no collection is recreated, no old index is dropped and no real record is modified by startup. If existing active orders already share the same `activeOrderKey`, MongoDB rejects the index build; the server reports the safe manual resolution instead of deleting data.
 
 ## Middleware pipeline
 
@@ -300,8 +312,14 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `GET` | `/api/admin/menu` | Bearer JWT + Admin | Lists every menu item with admin-safe fields |
 | `PATCH` | `/api/admin/menu/:id/status` | Bearer JWT + Admin | Approves or rejects a pending item |
 | `DELETE` | `/api/admin/menu/:id` | Bearer JWT + Admin | Deletes any menu item |
+| `POST` | `/api/orders` | Bearer JWT + Customer | Places an order from an approved, available item |
+| `GET` | `/api/orders/mine` | Bearer JWT + Customer | Lists only the customer's own orders |
+| `GET` | `/api/orders/:id` | Bearer JWT + Customer | Reads one of the customer's own orders |
+| `PATCH` | `/api/orders/:id/cancel` | Bearer JWT + Customer | Cancels the customer's own pending order |
+| `GET` | `/api/vendor/orders` | Bearer JWT + Vendor | Lists only the vendor's own orders, optionally by status |
+| `PATCH` | `/api/vendor/orders/:id/status` | Bearer JWT + Vendor | Accepts or rejects one of the vendor's own pending orders |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing) and `/api/admin/menu/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing), `/api/admin/menu/*`, `/api/orders/*` and `/api/vendor/orders/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -539,6 +557,45 @@ The response uses the same pagination shape as public browsing, with `items`, `p
 Approval only changes moderation status. Pending and approved items both consume a free-plan slot, so approval does not create an extra slot or bypass subscription limits. An approved item appears in public browsing only if its vendor has also made it available; a rejected item never appears publicly.
 
 `DELETE /api/admin/menu/:id` validates the ObjectId and deletes any owned or unowned menu item with `deleteOne`. It returns `204` on success and `404 MENU_ITEM_NOT_FOUND` when nothing was deleted. It does not call or introduce an image-storage service, so remote ImgBB cleanup remains a later concern.
+
+## Customer and vendor orders
+
+The four files in `src/modules/order/` implement the customer and vendor workflows on the existing `orders` collection. No payment, dashboard, transaction or new business collection is involved. Every route runs `authenticate` and then `requireRole(...)`; the identity and role come from the MongoDB user record in `req.user`, not from JWT role claims or request fields. Missing credentials return `401 UNAUTHORIZED`; the wrong role returns `403 FORBIDDEN`.
+
+### Customer endpoints
+
+`POST /api/orders` accepts exactly:
+
+```json
+{
+  "itemId": "65c000000000000000000001",
+  "deliveryDate": "2026-12-01",
+  "deliveryAddress": "123 Main Street",
+  "additionalMessage": "Leave at the door."
+}
+```
+
+`additionalMessage` is optional. `deliveryDate` must be a real `YYYY-MM-DD` calendar date; impossible dates such as `2026-02-30` are rejected. Address and message are trimmed and length-limited. Zod `.strict()` rejects unknown keys, and reserved fields such as `customerId`, `vendorId`, `price`, `status`, `itemSnapshot`, `activeOrderKey`, timestamps, ids, role and subscription fields return `400 FORBIDDEN_FIELD` before any MongoDB write.
+
+The menu item is loaded from MongoDB by its validated id. Price, vendor id, item details and availability are taken only from that record. A vendor cannot order their own item. Only `status: 'approved'` and `isAvailable: true` items are orderable; a missing item returns `404 MENU_ITEM_NOT_FOUND`, while an unapproved or unavailable item returns `409 MENU_ITEM_NOT_ORDERABLE`. New orders always start as `pending`, and the response stores the real server-derived `vendorId`. The creation response is `201` with `{ "order": … }`.
+
+An immutable `itemSnapshot` copies the item name, category, description, price, location, images and moderation/availability flags at creation time. Later vendor edits or deletions never mutate an existing order's snapshot or change its order total. The stored price on the order is the snapshot price.
+
+`GET /api/orders/mine` lists only documents whose `customerId` equals `req.user.id`, newest first. `GET /api/orders/:id` reads only an order with both the validated id and that `customerId`. `PATCH /api/orders/:id/cancel` cancels only a pending order owned by that customer. A missing id, another customer's id and a valid id that does not exist all return `404 ORDER_NOT_FOUND`; a malformed id returns `400 INVALID_ORDER_ID`. Cancelling an accepted, rejected or already cancelled order returns `409 ORDER_NOT_CANCELLABLE`.
+
+Both single-order and cancellation responses use `{ "order": … }`; list responses use `{ "items": [...], "pagination": { … } }`. The internal `activeOrderKey` is excluded by projection and by the serializer, so clients never see it.
+
+### Vendor endpoints
+
+`GET /api/vendor/orders` lists only documents whose `vendorId` equals `req.user.id`. It supports an optional exact `status` (`pending`, `accepted`, `rejected` or `cancelled`) plus `page` (1–10000, default `1`) and `limit` (1–50, default `12`). Unknown or operator-shaped query keys return `400 VALIDATION_ERROR`; MongoDB applies the server-built filter, sort, `skip()` and `limit()`.
+
+`PATCH /api/vendor/orders/:id/status` accepts exactly `{ "status": "accepted" }` or `{ "status": "rejected" }`. It updates only a pending order owned by that vendor. The pending condition is included in the `updateOne()` filter as well as checked before the write, so two simultaneous decisions cannot both succeed. `pending`, `cancelled`, arbitrary strings, unknown fields and protected fields are rejected. A missing or another vendor's order returns `404 ORDER_NOT_FOUND`; a non-pending order returns `409 ORDER_NOT_PENDING`; a malformed id returns `400 INVALID_ORDER_ID`. Accepted orders keep their active duplicate key; rejected orders release it.
+
+### Duplicate-active-order protection
+
+The service rejects a second `pending` or `accepted` order from the same customer for the same item and delivery date with `409 ORDER_ALREADY_ACTIVE`. The fast pre-check gives a readable response for the common case, while a unique partial MongoDB index on `activeOrderKey` is the atomic guard for concurrent requests. The server sets `activeOrderKey` only while an order is active and unsets it on customer cancellation or vendor rejection, so the customer may order again for that date after either outcome. A MongoDB duplicate-key race is translated into the same clean `409`; no record is deleted.
+
+The original non-unique `{ itemId: 1, customerId: 1, deliveryDate: 1 }` index is retained unchanged. If existing data prevents the unique index from being created, startup stops with a sanitized message naming the index and requiring manual conflict resolution; no records are modified. Legacy active orders created without `activeOrderKey` remain covered by the service check, but atomic protection applies only after the unique index has been created successfully.
 
 ## Admin seed script
 

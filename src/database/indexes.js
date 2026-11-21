@@ -9,9 +9,9 @@ import { getDb } from './mongo.js';
  * Index definitions for the three business collections.
  *
  * Explicit names make repeated runs idempotent and prevent accidentally
- * creating two indexes with slightly different specifications. There is no
- * text index and no price index yet: search/sort endpoints arrive in a later
- * milestone, so adding them now would be speculative.
+ * creating two indexes with slightly different specifications. Menu search is
+ * an escaped regex, so no text index is added; price sorting has no dedicated
+ * index either.
  */
 const INDEX_DEFINITIONS = Object.freeze([
   {
@@ -56,11 +56,25 @@ const INDEX_DEFINITIONS = Object.freeze([
         key: { vendorId: 1, status: 1, createdAt: -1 },
       },
 
-      // Duplicate active-order check for the same item, customer and date.
-      // Deliberately NOT unique: rejected/cancelled orders may be recreated.
+      // Retained from the original design. It is deliberately not unique;
+      // rejected/cancelled orders may be recreated and this index must stay
+      // untouched for existing deployments.
       {
         name: 'itemId_1_customerId_1_deliveryDate_1',
         key: { itemId: 1, customerId: 1, deliveryDate: 1 },
+      },
+
+      // Atomic duplicate-active-order guard. The server sets activeOrderKey
+      // only while an order is pending/accepted and unsets it on rejection or
+      // cancellation. A partial unique index therefore permits a fresh order
+      // later without ever dropping the older non-unique index above.
+      {
+        name: 'activeOrderKey_1',
+        key: { activeOrderKey: 1 },
+        options: {
+          unique: true,
+          partialFilterExpression: { activeOrderKey: { $exists: true } },
+        },
       },
 
       // Delivery-date lookups for scheduling.
@@ -175,8 +189,16 @@ export async function removeObsoleteIndexes(collection) {
   }
 }
 
+function isDuplicateKeyError(error) {
+  return (
+    error?.code === 11000 ||
+    error?.codeName === 'DuplicateKey' ||
+    error?.writeErrors?.some?.((writeError) => writeError?.code === 11000) === true
+  );
+}
+
 /** Never log raw driver text; it can reveal connection details. */
-function toSafeIndexError(error) {
+export function toSafeIndexError(error, indexName) {
   const diagnostic = [];
 
   if (typeof error?.name === 'string' && /^[A-Za-z]+$/.test(error.name)) {
@@ -187,33 +209,50 @@ function toSafeIndexError(error) {
     diagnostic.push(`code ${error.code}`);
   }
 
-  return diagnostic.length > 0
-    ? `Could not initialize database indexes. [${diagnostic.join(', ')}]`
-    : 'Could not initialize database indexes.';
+  const suffix = diagnostic.length > 0 ? ` [${diagnostic.join(', ')}]` : '';
+  const label = indexName ? ` '${indexName}'` : 'es';
+
+  if (isDuplicateKeyError(error)) {
+    return (
+      `Could not create unique index${label} because existing documents conflict.` +
+      ` No data was changed. Resolve the conflicting documents manually, then restart.${suffix}`
+    );
+  }
+
+  return `Could not initialize database index${label}.${suffix}`;
 }
 
 /**
  * Create all business indexes. Fixed names make this safe to run on every
  * startup and safe to call repeatedly. Returns the number of index specs.
+ *
+ * Indexes are created one at a time so a duplicate-data migration failure can
+ * name the index and explain the safe manual resolution. Nothing is deleted.
  */
 export async function initializeIndexes() {
   try {
     await removeObsoleteIndexes(getMenuItemsCollection());
-
-    for (const definition of INDEX_DEFINITIONS) {
-      const collection = definition.collection();
-
-      await collection.createIndexes(
-        definition.indexes.map(({ name, key, options }) => ({
-          name,
-          key,
-          ...options,
-        })),
-      );
-    }
-
-    return INDEX_DEFINITIONS.reduce((total, definition) => total + definition.indexes.length, 0);
   } catch (error) {
     throw new Error(toSafeIndexError(error));
   }
+
+  for (const definition of INDEX_DEFINITIONS) {
+    const collection = definition.collection();
+
+    for (const spec of definition.indexes) {
+      try {
+        await collection.createIndexes([
+          {
+            name: spec.name,
+            key: spec.key,
+            ...spec.options,
+          },
+        ]);
+      } catch (error) {
+        throw new Error(toSafeIndexError(error, spec.name));
+      }
+    }
+  }
+
+  return INDEX_DEFINITIONS.reduce((total, definition) => total + definition.indexes.length, 0);
 }
