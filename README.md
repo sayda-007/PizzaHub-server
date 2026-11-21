@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Milestone 2 of 15.** The Express foundation, health check and MongoDB Atlas connection are implemented. Authentication, business APIs, and payments are deliberately not implemented yet.
+> **Status: Milestone 3 of 15.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling and rate limiting are implemented. Authentication, business APIs, and payments are deliberately not implemented yet.
 
 ---
 
@@ -22,6 +22,10 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Startup blocked until MongoDB responds to a ping
 - Sanitized database errors that never print the connection string or credentials
 - Health-check endpoint
+- Reusable `ApiError` class carrying a safe message, HTTP status and error code
+- Centralized JSON error responses (4xx details, generic 5xx message in production)
+- 404 middleware for unknown routes
+- API rate limiting with JSON `429` responses
 - Graceful shutdown of both the HTTP server and MongoDB connection
 
 **Planned (later milestones)**
@@ -59,8 +63,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | `cors` | Cross-origin rules for the future client |
 | `zod` | Runtime validation of requests and environment variables |
 | `mongodb` | Official MongoDB driver: `MongoClient`, database selection, ping and close |
+| `express-rate-limit` | Shared API request limiter with standard rate-limit headers |
 
-Five runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
+Six runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
 
 ## Project structure
 
@@ -77,12 +82,18 @@ server/
     │   └── env.js                     # Zod-validated environment variables
     ├── database/
     │   └── mongo.js                   # MongoClient lifecycle, getDb(), close
+    ├── middlewares/
+    │   ├── error.js                   # centralized JSON error responses
+    │   ├── not-found.js               # 404 for unknown routes
+    │   └── rate-limit.js              # shared API limiter
+    ├── utils/
+    │   └── api-error.js               # ApiError class + status helpers
     └── modules/
         └── health/
             └── health.routes.js       # GET /api/health
 ```
 
-Planned folders: `auth/`, `middlewares/`, `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `utils/`, `validators/`, `scripts/`, `tests/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `auth/`, `modules/{user,menu,browse,order,admin,payment}/`, `routes/`, `services/`, `validators/`, `scripts/`, `tests/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -126,6 +137,45 @@ The server listens on `PORT` (default `5000`).
 If the connection fails, the process logs a fixed, descriptive message and exits with status `1`. The driver's raw error text is **never** logged, because it can contain the host, username or full connection string. Only a safe error name and numeric code are appended for debugging.
 
 `/api/health` intentionally remains a pure liveness check and does not query MongoDB. Since the server cannot start without a working database connection, a separate database field in that response would be redundant and would make a liveness probe fail for external reasons.
+
+## Middleware pipeline
+
+`createApp(env)` in `src/app.js` registers middleware in this order:
+
+1. **Helmet** — security headers.
+2. **CORS** — environment-driven origin whitelist. It runs early so CORS headers are also present on error responses.
+3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
+4. **express.json** — parses JSON bodies up to 1 MB.
+5. **Feature routers** — currently `/api/health`; later modules mount under `/api`.
+6. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
+7. **Error handler** — always last, so it catches errors from every earlier layer.
+
+## Error responses
+
+All failures share one envelope:
+
+```json
+{ "success": false, "message": "...", "code": "..." }
+```
+
+- `ApiError` carries a deliberately safe message, an HTTP status and a machine-readable code. Helpers exist for 400, 401, 403, 404, 409 and 429.
+- Zod validation failures become `400 VALIDATION_ERROR` with a `details` array of field/message pairs.
+- Malformed JSON becomes `400 INVALID_JSON`.
+- Unexpected errors become `500 INTERNAL_SERVER_ERROR` with a generic message in production. In development the message is included to help debugging. Stack traces are logged on the server only and are never sent to a client.
+
+## Rate limiting
+
+`src/middlewares/rate-limit.js` exports `createApiLimiter(env)`:
+
+| Environment | Requests per 15-minute window |
+| --- | --- |
+| `development` | 500 |
+| `test` | 10,000 |
+| `production` | 100 |
+
+IETF draft-7 `RateLimit` and `RateLimit-Policy` headers are emitted, along with `Retry-After` when throttled. `/api/health` is exempt so monitoring probes are never throttled. When the limit is exceeded, the limiter passes an `ApiError(429, …, 'RATE_LIMITED')` to the centralized handler, giving the same JSON shape as every other error. The limiter uses the default in-process memory store; a shared store would be needed if the API is later scaled across multiple instances.
+
+No new environment variables were introduced in this milestone.
 
 ## API endpoints
 
