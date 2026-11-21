@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth is implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Business APIs, authorization middleware and payments are deliberately not implemented yet.
+> **Status: Better Auth, JWT verification, and role-based authorization middleware are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Protected business APIs and payments are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -31,10 +31,12 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Graceful shutdown of both the HTTP server and MongoDB connection
 - Better Auth with email/password, optional Google OAuth, JWT/JWKS plugin and one shared MongoDB pool
 - Customer/vendor role selection at registration; role, block status and subscription changes owned exclusively by the server afterwards
+- JWKS-based JWT verification with `jose` (one cached remote JWKS resolver)
+- Bearer-token authentication middleware backed by the current MongoDB user record
+- Reusable `requireRole(...roles)` authorization middleware
 
 **Planned (later milestones)**
 
-- JWKS-based JWT verification middleware and role-based authorization
 - Vendor menu CRUD, availability, and subscription limits
 - Public menu browsing with search, filters, sorting, and pagination
 - Customer and vendor order workflows
@@ -52,7 +54,7 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | Web framework | Express 5 |
 | Database | MongoDB Atlas via the official `mongodb` Node.js driver |
 | Auth | Better Auth 1.7 with the official MongoDB adapter and JWT plugin |
-| JWT verification | `jose` (planned; the `/token` and `/jwks` endpoints already exist) |
+| JWT verification | `jose` (`createRemoteJWKSet` + `jwtVerify`) |
 | Payments | Stripe Checkout + webhooks (from Milestone 13) |
 | Validation | Zod |
 
@@ -68,8 +70,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | `express-rate-limit` | Shared API request limiter with standard rate-limit headers |
 | `better-auth` | Authentication hosted inside Express; JWT plugin from `better-auth/plugins` |
 | `@better-auth/mongo-adapter` | Official adapter that reuses the existing `Db` and `MongoClient` |
+| `jose` | Remote JWKS resolution and JWT signature/claim verification |
 
-Eight runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
+Nine runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
 
 ## Project structure
 
@@ -83,8 +86,9 @@ server/
     ├── server.js                      # process entry point + graceful shutdown
     ├── app.js                         # Express app factory
     ├── auth/
-    │   └── config/
-    │       └── better-auth.js         # Better Auth instance factory + user schema
+    │   ├── config/
+    │   │   └── better-auth.js         # Better Auth instance factory + user schema
+    │   └── jwt.js                     # cached JWKS resolver + JWT claim verification
     ├── config/
     │   └── env.js                     # Zod-validated environment variables
     ├── database/
@@ -92,12 +96,15 @@ server/
     │   ├── collections.js             # collection names + business accessors
     │   └── indexes.js                 # idempotent index initialization
     ├── middlewares/
+    │   ├── authenticate.js            # Bearer token -> verified user from MongoDB
+    │   ├── authorize.js               # requireRole(...) authorization factory
     │   ├── error.js                   # centralized JSON error responses
     │   ├── not-found.js               # 404 for unknown routes
     │   └── rate-limit.js              # shared API limiter
     ├── utils/
     │   └── api-error.js               # ApiError class + status helpers
     ├── tests/
+    │   ├── auth.test.js               # JWT, authentication and role tests
     │   └── error.test.js              # focused error-handler tests
     └── modules/
         └── health/
@@ -203,6 +210,8 @@ No text index or price index is created yet: those serve search/sort endpoints t
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
+`authenticate` and `requireRole(...)` are ready for future business routes but are not mounted globally. A protected route will opt in explicitly, for example `app.delete('/api/menu/:id', authenticate, requireRole('vendor'), handler)`. No public test-only auth route was added to the production API.
+
 ## Error responses
 
 All failures share one envelope:
@@ -291,9 +300,55 @@ Google is opt-in. Leave both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` unset
 4. Restart the server. `GET /api/auth/sign-in/social` with `provider=google` then starts the flow.
 5. Set `CLIENT_URL` to the frontend origin so it is trusted for cross-origin auth requests.
 
-## JWT verification
+## JWT verification and role-based authorization
 
-The JWT plugin is registered. `GET /api/auth/jwks` returns the public keys (Ed25519 by default), and `GET /api/auth/token` returns a signed token for a signed-in session. Future protected routes will verify the signature, issuer, audience and expiry with `jose`, then reload the user from MongoDB so role, block status and subscription changes take effect immediately. Unauthenticated requests will return `401`; forbidden requests will return `403`.
+### How verification works
+
+`src/auth/jwt.js` uses `jose` to verify tokens produced by Better Auth's JWT plugin:
+
+- `GET /api/auth/token` gives a signed-in user a JWT. `GET /api/auth/jwks` publishes the matching **public** keys.
+- The JWKS URL is built from `BETTER_AUTH_URL`: `<BETTER_AUTH_URL>/api/auth/jwks`.
+- `createRemoteJWKSet()` is called **once** when the verifier is created. The resolver caches keys and only fetches again when needed, so it is not rebuilt per request.
+- `jwtVerify()` checks the signature, expiration, issuer and audience. Better Auth uses `BETTER_AUTH_URL` as both issuer and audience by default, so the verifier uses the same value.
+- The configured Better Auth `jwt()` call does not override `keyPairConfig.alg`; the plugin default is **EdDSA with Ed25519**. Verification explicitly allows only `EdDSA`, preventing algorithm confusion.
+- A token must have a non-empty `sub`. Better Auth sets it to the user id.
+- Verification failures become one generic internal error. No token, key, claim or library error text is sent to the client or logged by this module.
+
+There is no second JWT secret and no duplicate auth system: the same Better Auth keys and configuration are the source of truth.
+
+### Authentication middleware
+
+`createAuthenticate(env, dependencies)` in `src/middlewares/authenticate.js`:
+
+1. Requires an `Authorization: Bearer <token>` header; missing or malformed headers return `401`.
+2. Verifies the token through the shared JWT verifier.
+3. Reads `sub` and loads that user from the `users` collection owned by Better Auth.
+4. Accepts both ObjectId and string ids. The MongoDB adapter maps `id` to `_id` and normally stores an ObjectId, but string ids are supported too.
+5. Returns `401` if the user no longer exists.
+6. Returns `403` if `isBlocked === true` in MongoDB.
+7. Attaches a sanitized `req.user` containing only `id`, `name`, `email`, `image`, `role`, `businessName`, `subscriptionPlan` and `subscriptionExpiresAt`. Password hashes, reset tokens and other private fields are never attached.
+
+Role, subscription and blocked status are read from **MongoDB**, not from JWT claims. This means a role or ban change takes effect on the next request without waiting for the short-lived token to expire. Database failures and JWKS fetch failures are passed to the centralized error handler as generic `500` responses; they are never disguised as bad credentials or exposed to clients.
+
+### Role authorization middleware
+
+`requireRole(...roles)` in `src/middlewares/authorize.js` checks `req.user.role` after authentication. It supports `customer`, `vendor` and `admin`, and rejects unknown role names when the middleware is created.
+
+```js
+app.get('/api/admin/example', authenticate, requireRole('admin'), handler);
+app.post('/api/menu', authenticate, requireRole('vendor'), handler);
+```
+
+Authentication and authorization stay separate: `authenticate` answers **who the user is**; `requireRole` answers **whether that user may do this**.
+
+### `401` vs `403`
+
+| Code | Meaning here |
+| --- | --- |
+| `401 UNAUTHORIZED` | The request has no usable Bearer token, the token is invalid/expired, or its user no longer exists. |
+| `403 FORBIDDEN` | The token and user are valid, but the account is blocked or its database role is not allowed for the route. |
+
+Both use the normal JSON error envelope. The messages are fixed and safe; internal verification and database details are never exposed.
 
 ## Advanced search and sorting
 
