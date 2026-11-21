@@ -7,6 +7,7 @@ import { createAuth } from './auth/config/better-auth.js';
 import { createErrorHandler } from './middlewares/error.js';
 import { notFound } from './middlewares/not-found.js';
 import { createApiLimiter } from './middlewares/rate-limit.js';
+import { createAdminMenuRoutes } from './modules/admin/admin-menu.routes.js';
 import healthRoutes from './modules/health/health.routes.js';
 import { createMenuRoutes } from './modules/menu/menu.routes.js';
 import { createUserRoutes } from './modules/user/user.routes.js';
@@ -62,6 +63,7 @@ export function createApp(env) {
   app.use('/api/health', healthRoutes);
   app.use('/api/users', createUserRoutes(env));
   app.use('/api/menu', createMenuRoutes(env));
+  app.use('/api/admin/menu', createAdminMenuRoutes(env));
 
   app.use(notFound);
   app.use(createErrorHandler(env));

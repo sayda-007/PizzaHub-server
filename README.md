@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, and public menu browsing are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, and Admin menu moderation are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -41,12 +41,13 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Public menu browsing with validated search, filters, sorting and pagination
 - Ownership checks inside every MongoDB menu query
 - Server-side Free/Premium menu item limits with pending items reserving slots
+- Admin-only menu listing, approval, rejection and deletion
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
 - Customer and vendor order workflows
-- Admin dashboard, moderation, and user management
+- Admin dashboard and user management
 - Stripe premium subscription checkout and verified webhooks
 - Integration tests and deployment documentation
 
@@ -120,8 +121,14 @@ server/
     │   ├── user.test.js               # profile endpoint tests with fakes
     │   ├── seed-admin.test.js         # seed tests with mocks + in-memory auth
     │   ├── imgbb.test.js              # upload validation with injected fetch
-    │   └── menu.test.js               # vendor menu API with fake collections
+    │   ├── menu.test.js               # vendor menu API with fake collections
+    │   └── admin-menu.test.js         # admin moderation API with fake collections
     └── modules/
+        ├── admin/
+        │   ├── admin-menu.routes.js   # authenticated admin-only routing
+        │   ├── admin-menu.controller.js # request/response handling
+        │   ├── admin-menu.service.js  # all-status listing and status-only writes
+        │   └── admin-menu.validator.js # Zod query and moderation validation
         ├── health/
         │   └── health.routes.js       # GET /api/health
         ├── user/
@@ -136,7 +143,7 @@ server/
             └── menu.validator.js      # Zod body, public query and pagination validation
 ```
 
-Planned folders: `modules/{browse,order,admin,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `modules/{browse,order,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -235,13 +242,13 @@ Public search uses an escaped regular expression against `itemName` and `descrip
 3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
 4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
 5. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
-6. **Feature routers** — currently `/api/health`, `/api/users` and `/api/menu`; later modules mount under `/api`.
+6. **Feature routers** — currently `/api/health`, `/api/users`, `/api/menu` and `/api/admin/menu`; later modules mount under `/api`.
 7. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
 8. **Error handler** — always last, so it catches errors from every earlier layer.
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
-`authenticate` is mounted explicitly on `/api/users/me` and every vendor management route under `/api/menu`. `GET /api/menu` is the only public menu route; its exact path does not capture `/mine`, which keeps its own auth and vendor guards. `requireRole('vendor')` runs after authentication on all management routes. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
+`authenticate` is mounted explicitly on `/api/users/me`, every vendor management route under `/api/menu`, and the whole `/api/admin/menu` router. `GET /api/menu` is the only public menu route; its exact path does not capture `/mine`, which keeps its own auth and vendor guards. `requireRole('vendor')` runs after authentication on vendor management routes, while `requireRole('admin')` runs after authentication on every admin menu route. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
 
 ## Error responses
 
@@ -290,8 +297,11 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `PATCH` | `/api/menu/:id` | Bearer JWT + Vendor | Updates an owned item |
 | `PATCH` | `/api/menu/:id/availability` | Bearer JWT + Vendor | Toggles `isAvailable` on an owned item |
 | `DELETE` | `/api/menu/:id` | Bearer JWT + Vendor | Deletes an owned item |
+| `GET` | `/api/admin/menu` | Bearer JWT + Admin | Lists every menu item with admin-safe fields |
+| `PATCH` | `/api/admin/menu/:id/status` | Bearer JWT + Admin | Approves or rejects a pending item |
+| `DELETE` | `/api/admin/menu/:id` | Bearer JWT + Admin | Deletes any menu item |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*` and `/api/menu/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing) and `/api/admin/menu/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -446,7 +456,7 @@ Required categories:
 
 A new item is submitted with `status: 'pending'` and `isAvailable: true`. Pending approval and vendor availability are different ideas:
 
-- `status` is Admin-owned. Vendors cannot set or patch it. Admin moderation is a later milestone.
+- `status` is Admin-owned. Vendors cannot set or patch it. Only `PATCH /api/admin/menu/:id/status` can move a pending item to `approved` or `rejected`.
 - `isAvailable` is vendor-owned. `PATCH /api/menu/:id/availability` flips the current boolean value.
 
 ### Subscription item limits
@@ -495,6 +505,40 @@ Safe limits:
 | MIME types | JPEG, PNG, WebP, GIF | SVG and other types are rejected |
 
 Missing or placeholder credentials produce `500 IMAGE_UPLOAD_UNAVAILABLE`. Multer/ImgBB failures produce safe `400`/`413`/`502` responses with fixed messages. Raw fetch text, response bodies and the API key are never returned.
+
+## Admin menu moderation
+
+The four files in `src/modules/admin/` keep moderation separate from vendor management. The router mounts `authenticate` and `requireRole('admin')` before every handler. The role comes from the MongoDB user record loaded into `req.user`; JWT role claims and client-supplied role fields are ignored. Missing credentials return `401 UNAUTHORIZED`, while customers and vendors get `403 FORBIDDEN`.
+
+### Listing all submissions
+
+`GET /api/admin/menu` starts with an empty MongoDB filter, so `pending`, `approved`, `rejected` and `inactive` items are all visible. Supported query parameters are:
+
+| Parameter | Validation | Behavior |
+| --- | --- | --- |
+| `search` | Optional trimmed string, 1–100 characters, no control characters | Escaped case-insensitive literal regex over `itemName` and `description`. |
+| `status` | Optional exact `pending`, `approved`, `rejected` or `inactive` | Equality filter. |
+| `category` | Optional exact member of `MENU_CATEGORIES` | Equality filter. |
+| `location` | Optional trimmed string, 1–120 characters, no control characters | Exact equality filter. |
+| `page` | Integer, 1–10000, default `1` | Applied with MongoDB `skip()`. |
+| `limit` | Integer, 1–50, default `12` | Applied with MongoDB `limit()`. |
+
+There is deliberately no client-controlled `sort` or projection; results use a fixed `{ createdAt: -1, _id: -1 }` order. Zod `.strict()` rejects unknown keys and operator-shaped keys before MongoDB sees them, and `escapeRegex()` prevents search input from becoming regex syntax. Counting and page retrieval use the same server-built filter, so the full collection is never loaded into Express.
+
+The response uses the same pagination shape as public browsing, with `items`, `pagination.page`, `pagination.limit`, `pagination.totalItems` and `pagination.totalPages`. Empty results return `items: []` and `totalPages: 0`. An inclusion projection plus `serializeMenu()` allow-list include the fields admins need (`vendorId`, `status`, `isAvailable`, item details and timestamps) while excluding Better Auth secrets, sessions, credentials and unrelated user fields.
+
+### Decisions and deletion
+
+`PATCH /api/admin/menu/:id/status` accepts exactly `{ "status": "approved" }` or `{ "status": "rejected" }`. The service validates the canonical 24-character ObjectId, loads the item, and then writes only `{ status, updatedAt }` with `$set`; the pending condition is part of the update filter. vendorId, price, availability, timestamps, subscription fields and every other item field are ignored by the write path and rejected during validation. There are no ImgBB calls in this flow.
+
+- A missing item returns `404 MENU_ITEM_NOT_FOUND`.
+- An already approved, rejected or inactive item returns `409 MENU_ITEM_NOT_PENDING`; it cannot be moderated twice.
+- A malformed id returns `400 INVALID_MENU_ID`.
+- Reserved or unknown body fields return `400 FORBIDDEN_FIELD` or `400 VALIDATION_ERROR`.
+
+Approval only changes moderation status. Pending and approved items both consume a free-plan slot, so approval does not create an extra slot or bypass subscription limits. An approved item appears in public browsing only if its vendor has also made it available; a rejected item never appears publicly.
+
+`DELETE /api/admin/menu/:id` validates the ObjectId and deletes any owned or unowned menu item with `deleteOne`. It returns `204` on success and `404 MENU_ITEM_NOT_FOUND` when nothing was deleted. It does not call or introduce an image-storage service, so remote ImgBB cleanup remains a later concern.
 
 ## Admin seed script
 
