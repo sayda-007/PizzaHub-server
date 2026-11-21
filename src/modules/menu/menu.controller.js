@@ -3,11 +3,11 @@ import { ApiError } from '../../utils/api-error.js';
 import { validateMenuCreate } from './menu.validator.js';
 
 /**
- * Thin Express adapter for vendor menu management.
+ * Thin Express adapter for menu routes.
  *
- * `authenticate` verifies the Bearer JWT and loads the current user from
- * MongoDB; `requireRole('vendor')` then guards every route in this module. The
- * controller only reads req.user.id and never trusts a client-supplied id.
+ * `GET /` is public and only reads validated query options. The management
+ * handlers run after `authenticate` and `requireRole('vendor')`; they read
+ * req.user.id and never trust a client-supplied id.
  */
 export function createMenuController(service, imageUploader) {
   /**
@@ -25,6 +25,17 @@ export function createMenuController(service, imageUploader) {
   }
 
   return {
+    async listPublic(req, res, next) {
+      try {
+        // No req.user access: public browsing is available without a token.
+        const result = await service.listPublic(req.query);
+
+        return res.json(result);
+      } catch (error) {
+        return next(error);
+      }
+    },
+
     async create(req, res, next) {
       try {
         const vendor = currentVendor(req);

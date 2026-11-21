@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, and Free/Premium menu item limits are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Public browsing, orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, and public menu browsing are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -38,13 +38,13 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - `PATCH /api/users/me` for `name`, `image`, and vendor-only `businessName`
 - Idempotent, server-only Admin seed that uses Better Auth's password hashing
 - Vendor-only menu create, list, update, availability toggle and delete APIs
+- Public menu browsing with validated search, filters, sorting and pagination
 - Ownership checks inside every MongoDB menu query
 - Server-side Free/Premium menu item limits with pending items reserving slots
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
-- Public menu browsing with search, filters, sorting, and pagination
 - Customer and vendor order workflows
 - Admin dashboard, moderation, and user management
 - Stripe premium subscription checkout and verified webhooks
@@ -133,7 +133,7 @@ server/
             ├── menu.routes.js         # vendor-only routing + scoped Multer
             ├── menu.controller.js     # request/response handling
             ├── menu.service.js        # ownership-aware MongoDB queries
-            └── menu.validator.js      # Zod body and pagination validation
+            └── menu.validator.js      # Zod body, public query and pagination validation
 ```
 
 Planned folders: `modules/{browse,order,admin,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
@@ -198,7 +198,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 | Index | Purpose |
 | --- | --- |
 | `{ vendorId: 1, createdAt: -1 }` | Vendor's own items, newest first; the prefix also serves `vendorId`-only lookups. |
-| `{ status: 1, createdAt: -1 }` | Public browse uses `status: 'approved'` only; pending, rejected and inactive items are excluded by that single field. |
+| `{ status: 1, createdAt: -1 }` | Public browse equality on `status: 'approved'`, newest first. The separate `isAvailable: true` equality is applied by MongoDB. |
 | `{ category: 1, status: 1, createdAt: -1 }` | Category filter combined with the public status filter. |
 | `{ location: 1, status: 1, createdAt: -1 }` | Location filter combined with the public status filter. |
 | `{ createdAt: -1 }` | Admin listing of all submissions, newest first. |
@@ -222,9 +222,9 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 | `{ status: 1, createdAt: -1 }` | Admin filtering by payment status. |
 | `{ createdAt: -1 }` | Admin listing of all transactions, newest first. |
 
-`isAvailable` is now a vendor-controlled boolean, but its old compound indexes were from a different design and are still removed: initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched. Vendor listing uses the existing `{ vendorId: 1, createdAt: -1 }` index. Public visibility will still combine an Admin-approved `status` (`approved`) with availability when public browsing is implemented in a later milestone.
+`isAvailable` is a vendor-controlled boolean. Its old compound indexes were from a different design and are still removed: initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched. Vendor listing uses the existing `{ vendorId: 1, createdAt: -1 }` index, and public browsing reuses the status/category/location indexes above.
 
-No text index or price index is created yet: those serve search/sort endpoints that are not implemented until a later milestone. The `_id` index is provided automatically by MongoDB.
+Public search uses an escaped regular expression against `itemName` and `description`, so no text index is created. Price sorting is performed by MongoDB with the existing status prefix as the starting filter; no dedicated price index is added speculatively. The `_id` index is provided automatically by MongoDB.
 
 ## Middleware pipeline
 
@@ -241,7 +241,7 @@ No text index or price index is created yet: those serve search/sort endpoints t
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
-`authenticate` is mounted explicitly on `/api/users/me` and every `/api/menu` route. `requireRole('vendor')` runs after authentication on all menu routes. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
+`authenticate` is mounted explicitly on `/api/users/me` and every vendor management route under `/api/menu`. `GET /api/menu` is the only public menu route; its exact path does not capture `/mine`, which keeps its own auth and vendor guards. `requireRole('vendor')` runs after authentication on all management routes. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
 
 ## Error responses
 
@@ -284,6 +284,7 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `POST` | `/api/auth/sign-out` | Session | Ends the session |
 | `GET` | `/api/users/me` | Bearer JWT | Returns the current user's safe profile |
 | `PATCH` | `/api/users/me` | Bearer JWT | Updates `name`, `image`, and vendor-only `businessName` |
+| `GET` | `/api/menu` | Public | Browses approved available items with search, filters, sorting and pagination |
 | `POST` | `/api/menu` | Bearer JWT + Vendor | Creates a pending item with uploaded images |
 | `GET` | `/api/menu/mine` | Bearer JWT + Vendor | Lists only the vendor's own items with pagination |
 | `PATCH` | `/api/menu/:id` | Bearer JWT + Vendor | Updates an owned item |
@@ -464,9 +465,10 @@ These fields are server-owned and will be updated by the later Stripe webhook mi
 
 ### Request rules
 
-Every endpoint requires `Authorization: Bearer <jwt>` and a MongoDB role of `vendor`. A session cookie is not accepted.
+Vendor management endpoints require `Authorization: Bearer <jwt>` and a MongoDB role of `vendor`. A session cookie is not accepted. `GET /api/menu` is public and needs no token.
 
 - `POST /api/menu` expects `multipart/form-data`. Text fields are validated with strict Zod; the image files must be in the `images` field. Client-supplied image URL strings are rejected.
+- `GET /api/menu` accepts `search`, `category`, `location`, `sort`, `page` and `limit` only. Defaults are `sort=newest`, `page=1` and `limit=12` (maximum `50`). See [Advanced search and sorting](#advanced-search-and-sorting).
 - `GET /api/menu/mine` accepts `page` (default `1`, max `10000`) and `limit` (default `10`, max `50`) and returns `{ items, pagination }`.
 - `PATCH /api/menu/:id` accepts only `itemName`, `category`, `description`, `price` and `location`. Availability has its own route.
 - `PATCH /api/menu/:id/availability` takes no body.
@@ -515,7 +517,55 @@ No Admin plugin was added. The plugin installed with Better Auth 1.7.27 defaults
 
 ## Advanced search and sorting
 
-The public menu endpoint will support name search, category and location filters, advanced text search, price sorting in both directions, and pagination. Implementation notes will be added in Milestone 9.
+`GET /api/menu` is public. Its MongoDB filter is always built by the server from two fixed visibility conditions plus validated options:
+
+```js
+{
+  status: 'approved',
+  isAvailable: true,
+  // optional: $or search, category equality, location equality
+}
+```
+
+Only approved and available items are returned; pending, rejected, inactive and unavailable items can never appear. There is no `status` or `isAvailable` query parameter. The database projection removes `vendorId`, `status` and `isAvailable` before documents reach Express, and `serializePublicMenu()` uses a separate allow-list, so private vendor or moderation fields are not exposed.
+
+| Parameter | Validation | Behavior |
+| --- | --- | --- |
+| `search` | Optional trimmed string, 1–100 characters, no control characters | Case-insensitive literal phrase search over `itemName` and `description`. Every regex metacharacter is escaped before building `$regex`, so `.*`, `(`, `$` and similar input cannot become regex syntax or a ReDoS pattern. |
+| `category` | Optional exact member of `MENU_CATEGORIES` | Equality filter. Invalid categories return `400 VALIDATION_ERROR`. |
+| `location` | Optional trimmed string, 1–120 characters, no control characters | Exact equality filter. |
+| `sort` | `newest` (default), `price-asc`, or `price-desc` | Any other value returns `400 VALIDATION_ERROR`. Every sort includes `_id` as a stable tiebreaker. |
+| `page` | Integer, 1–10000, default `1` | Applied with MongoDB `skip()`. |
+| `limit` | Integer, 1–50, default `12` | Applied with MongoDB `limit()`. Values above `50` are rejected. |
+
+The query object is parsed with Zod `.strict()`. Unknown keys including MongoDB operator shapes such as `where[$ne]` or `search[$ne]` are rejected before MongoDB sees them. Client-supplied sort directions, filters and projections are never accepted.
+
+Counting and page retrieval both run in MongoDB with the same filter; the whole collection is never loaded into application memory. Empty results return `200` with `items: []` and `totalPages: 0`.
+
+```json
+{
+  "items": [
+    {
+      "id": "65c000000000000000000001",
+      "itemName": "Margherita",
+      "category": "Classic Pizzas",
+      "description": "Tomato, mozzarella and basil.",
+      "price": 12.5,
+      "location": "Downtown",
+      "images": ["https://i.ibb.co/example.png"],
+      "createdAt": "2026-01-01T00:00:00.000Z"
+    }
+  ],
+  "pagination": {
+    "page": 1,
+    "limit": 12,
+    "totalItems": 1,
+    "totalPages": 1
+  }
+}
+```
+
+`updatedAt` appears in an item only when the stored document has it. The public route is exact: `/api/menu/mine` still reaches its authenticated vendor-only handler instead of the public handler.
 
 ## Stripe webhooks
 

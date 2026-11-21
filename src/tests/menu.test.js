@@ -106,8 +106,20 @@ function valuesEqual(left, right) {
   return left === right;
 }
 
-/** Small fake-filter evaluator for the $in/$ne operators used by slot counting. */
+/** Small fake-filter evaluator for the operators used by menu queries. */
 function matchesValue(expected, actual) {
+  if (expected instanceof RegExp) {
+    return expected.test(String(actual ?? ''));
+  }
+
+  if (expected && typeof expected === 'object' && Object.hasOwn(expected, '$regex')) {
+    const source =
+      typeof expected.$regex === 'string' ? expected.$regex : expected.$regex.source;
+    const flags = expected.$options ?? expected.$regex.flags ?? '';
+
+    return new RegExp(source, flags).test(String(actual ?? ''));
+  }
+
   if (expected && typeof expected === 'object' && Object.hasOwn(expected, '$in')) {
     return expected.$in.some((candidate) => valuesEqual(candidate, actual));
   }
@@ -120,9 +132,33 @@ function matchesValue(expected, actual) {
 }
 
 function matches(filter, item) {
-  return Object.entries(filter ?? {}).every(([key, expected]) =>
-    matchesValue(expected, item[key]),
-  );
+  return Object.entries(filter ?? {}).every(([key, expected]) => {
+    if (key === '$or') {
+      return expected.some((condition) => matches(condition, item));
+    }
+
+    if (key === '$and') {
+      return expected.every((condition) => matches(condition, item));
+    }
+
+    return matchesValue(expected, item[key]);
+  });
+}
+
+function applyProjection(item, projection) {
+  if (!projection) {
+    return item;
+  }
+
+  const result = { ...item };
+
+  for (const [field, include] of Object.entries(projection)) {
+    if (include === 0) {
+      delete result[field];
+    }
+  }
+
+  return result;
 }
 
 function createFakeCollection() {
@@ -178,18 +214,29 @@ function createFakeCollection() {
       record('find', { filter });
 
       let selected = state.items.filter((item) => matches(filter, item));
+      let projection = null;
       let skipCount = 0;
       let limitCount = Infinity;
 
       const cursor = {
+        project(spec) {
+          projection = spec;
+          record('project', { projection: spec });
+          return cursor;
+        },
         sort(spec) {
+          record('sort', { spec });
           const entries = Object.entries(spec);
           selected = [...selected].sort((left, right) => {
             for (const [field, direction] of entries) {
               const a = left[field];
               const b = right[field];
 
-              if (a instanceof Date && b instanceof Date) {
+              if (typeof a === 'number' && typeof b === 'number') {
+                if (a !== b) {
+                  return a < b ? -direction : direction;
+                }
+              } else if (a instanceof Date && b instanceof Date) {
                 if (a.getTime() !== b.getTime()) {
                   return a.getTime() < b.getTime() ? -direction : direction;
                 }
@@ -205,14 +252,18 @@ function createFakeCollection() {
         },
         skip(count) {
           skipCount = count;
+          record('skip', { count });
           return cursor;
         },
         limit(count) {
           limitCount = count;
+          record('limit', { count });
           return cursor;
         },
         async toArray() {
-          return selected.slice(skipCount, skipCount + limitCount);
+          return selected
+            .slice(skipCount, skipCount + limitCount)
+            .map((item) => applyProjection(item, projection));
         },
       };
 
@@ -272,6 +323,15 @@ function seedSlotItems(collection, count, overrides = {}) {
     });
 
     return _id;
+  });
+}
+
+function seedPublicItem(overrides = {}) {
+  return fakeCollection.seedItem({
+    _id: new ObjectId(),
+    status: MENU_STATUS.APPROVED,
+    isAvailable: true,
+    ...overrides,
   });
 }
 
@@ -429,6 +489,253 @@ after(async () => {
   if (server) {
     await new Promise((resolve) => server.close(resolve));
   }
+});
+
+test('GET /api/menu is public and returns only approved available items', async () => {
+  const visible = seedPublicItem({ itemName: 'Visible Pizza' });
+  seedPublicItem({ itemName: 'Pending Pizza', status: MENU_STATUS.PENDING });
+  seedPublicItem({ itemName: 'Rejected Pizza', status: MENU_STATUS.REJECTED });
+  seedPublicItem({ itemName: 'Inactive Pizza', status: MENU_STATUS.INACTIVE });
+  seedPublicItem({ itemName: 'Unavailable Pizza', isAvailable: false });
+
+  const response = await request('/api/menu');
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.items.length, 1);
+  assert.equal(body.items[0].id, String(visible._id));
+  assert.equal(body.items[0].itemName, 'Visible Pizza');
+
+  for (const field of ['vendorId', 'status', 'isAvailable']) {
+    assert.equal(Object.hasOwn(body.items[0], field), false);
+  }
+
+  assert.deepEqual(body.pagination, {
+    page: 1,
+    limit: 12,
+    totalItems: 1,
+    totalPages: 1,
+  });
+
+  const findCall = fakeCollection.state.calls.find((call) => call.method === 'find');
+
+  assert.deepEqual(findCall.filter, {
+    status: MENU_STATUS.APPROVED,
+    isAvailable: true,
+  });
+  assert.deepEqual(
+    fakeCollection.state.calls.find((call) => call.method === 'project').projection,
+    { vendorId: 0, status: 0, isAvailable: 0 },
+  );
+  assert.equal(fakeCollection.state.calls.filter((call) => call.method === 'countDocuments').length, 1);
+});
+
+test('public search matches item names and descriptions case-insensitively', async () => {
+  const byName = seedPublicItem({ itemName: 'Pepperoni Feast', description: 'Classic' });
+  const byDescription = seedPublicItem({
+    itemName: 'Veggie Delight',
+    description: 'Pepperoni surprise',
+  });
+  seedPublicItem({ itemName: 'Plain Cheese', description: 'Simple' });
+
+  const response = await request(`/api/menu?search=${encodeURIComponent('pepperoni')}`);
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(
+    body.items.map((item) => item.id).sort(),
+    [String(byName._id), String(byDescription._id)].sort(),
+  );
+
+  const findCall = fakeCollection.state.calls.find((call) => call.method === 'find');
+
+  assert.deepEqual(findCall.filter.$or, [
+    { itemName: { $regex: 'pepperoni', $options: 'i' } },
+    { description: { $regex: 'pepperoni', $options: 'i' } },
+  ]);
+});
+
+test('search text is regex-escaped and cannot inject MongoDB operators', async () => {
+  const literal = seedPublicItem({ itemName: 'Pizza (Special)', description: 'literal' });
+  seedPublicItem({ itemName: 'Pizza Special', description: 'without parentheses' });
+  seedPublicItem({ itemName: 'Anything', description: 'regex demo' });
+
+  const literalResponse = await request(
+    `/api/menu?search=${encodeURIComponent('Pizza (Special)')}`,
+  );
+  const literalBody = await literalResponse.json();
+
+  assert.equal(literalResponse.status, 200);
+  assert.deepEqual(literalBody.items.map((item) => item.id), [String(literal._id)]);
+
+  const wildcardResponse = await request(`/api/menu?search=${encodeURIComponent('.*')}`);
+  const wildcardBody = await wildcardResponse.json();
+
+  assert.equal(wildcardResponse.status, 200);
+  assert.deepEqual(wildcardBody.items, []);
+
+  const findCalls = fakeCollection.state.calls.filter((call) => call.method === 'find');
+
+  assert.deepEqual(findCalls[1].filter.$or[0].itemName, {
+    $regex: '\\.\\*',
+    $options: 'i',
+  });
+  assert.equal(Object.hasOwn(findCalls[1].filter, 'where'), false);
+  assert.equal(Object.hasOwn(findCalls[1].filter, '$where'), false);
+});
+
+test('public category and location filters are validated and applied in MongoDB', async () => {
+  const classic = seedPublicItem({
+    itemName: 'Classic One',
+    category: 'Classic Pizzas',
+    location: 'Downtown',
+  });
+  const dessert = seedPublicItem({
+    itemName: 'Sweet One',
+    category: 'Beverages & Desserts',
+    location: 'South Campus',
+  });
+
+  const categoryResponse = await request(
+    `/api/menu?category=${encodeURIComponent('Classic Pizzas')}`,
+  );
+  const categoryBody = await categoryResponse.json();
+
+  assert.equal(categoryResponse.status, 200);
+  assert.deepEqual(categoryBody.items.map((item) => item.id), [String(classic._id)]);
+
+  const locationResponse = await request(
+    `/api/menu?location=${encodeURIComponent('South Campus')}`,
+  );
+  const locationBody = await locationResponse.json();
+
+  assert.equal(locationResponse.status, 200);
+  assert.deepEqual(locationBody.items.map((item) => item.id), [String(dessert._id)]);
+
+  const findCalls = fakeCollection.state.calls.filter((call) => call.method === 'find');
+
+  assert.equal(findCalls[0].filter.category, 'Classic Pizzas');
+  assert.equal(findCalls[1].filter.location, 'South Campus');
+  assert.equal(findCalls[0].filter.status, MENU_STATUS.APPROVED);
+  assert.equal(findCalls[0].filter.isAvailable, true);
+});
+
+test('public sorting supports newest, price-asc and price-desc', async () => {
+  seedPublicItem({
+    itemName: 'Oldest Expensive',
+    price: 20,
+    createdAt: new Date('2026-01-01T00:00:00.000Z'),
+  });
+  seedPublicItem({
+    itemName: 'Middle Cheapest',
+    price: 5,
+    createdAt: new Date('2026-02-01T00:00:00.000Z'),
+  });
+  seedPublicItem({
+    itemName: 'Newest Middle',
+    price: 12,
+    createdAt: new Date('2026-03-01T00:00:00.000Z'),
+  });
+
+  async function namesFor(query = '') {
+    const response = await request(`/api/menu${query}`);
+
+    assert.equal(response.status, 200);
+
+    return (await response.json()).items.map((item) => item.itemName);
+  }
+
+  assert.deepEqual(await namesFor(), ['Newest Middle', 'Middle Cheapest', 'Oldest Expensive']);
+  assert.deepEqual(await namesFor('?sort=price-asc'), [
+    'Middle Cheapest',
+    'Newest Middle',
+    'Oldest Expensive',
+  ]);
+  assert.deepEqual(await namesFor('?sort=price-desc'), [
+    'Oldest Expensive',
+    'Newest Middle',
+    'Middle Cheapest',
+  ]);
+
+  const sorts = fakeCollection.state.calls
+    .filter((call) => call.method === 'sort')
+    .map((call) => call.spec);
+
+  assert.deepEqual(sorts, [
+    { createdAt: -1, _id: -1 },
+    { price: 1, createdAt: -1, _id: -1 },
+    { price: -1, createdAt: -1, _id: -1 },
+  ]);
+});
+
+test('public pagination returns MongoDB-page results and correct totals', async () => {
+  for (let day = 1; day <= 5; day += 1) {
+    seedPublicItem({
+      itemName: `Item ${day}`,
+      price: day,
+      createdAt: new Date(Date.UTC(2026, 0, day)),
+    });
+  }
+
+  const response = await request('/api/menu?page=2&limit=2');
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.items.map((item) => item.itemName), ['Item 3', 'Item 2']);
+  assert.deepEqual(body.pagination, {
+    page: 2,
+    limit: 2,
+    totalItems: 5,
+    totalPages: 3,
+  });
+  assert.equal(fakeCollection.state.calls.find((call) => call.method === 'skip').count, 2);
+  assert.equal(fakeCollection.state.calls.find((call) => call.method === 'limit').count, 2);
+});
+
+test('public pagination handles an empty result set', async () => {
+  const response = await request('/api/menu');
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.deepEqual(body.items, []);
+  assert.deepEqual(body.pagination, {
+    page: 1,
+    limit: 12,
+    totalItems: 0,
+    totalPages: 0,
+  });
+});
+
+test('invalid public query parameters are rejected before any database work', async () => {
+  const callsBefore = fakeCollection.state.calls.length;
+  const badPaths = [
+    '/api/menu?sort=highest-price',
+    '/api/menu?limit=500',
+    '/api/menu?page=-1',
+    `/api/menu?category=${encodeURIComponent('Not A Category')}`,
+    '/api/menu?where[$ne]=null',
+    '/api/menu?search[$ne]=null',
+    '/api/menu?unknown=value',
+  ];
+
+  for (const path of badPaths) {
+    await expectStatus(await request(path), 400, 'VALIDATION_ERROR');
+  }
+
+  assert.equal(fakeCollection.state.calls.length, callsBefore);
+});
+
+test('the public GET route does not weaken vendor-only menu management routes', async () => {
+  seedPublicItem();
+
+  await expectStatus(await request('/api/menu/mine'), 401, 'UNAUTHORIZED');
+
+  const response = await bearer('/api/menu/mine', 'vendor-token');
+  const body = await response.json();
+
+  assert.equal(response.status, 200);
+  assert.equal(body.items.length, 1);
+  assert.equal(body.pagination.total, 1);
 });
 
 test('unauthenticated vendor menu requests are rejected before upload parsing', async () => {

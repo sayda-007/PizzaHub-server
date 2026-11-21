@@ -19,7 +19,15 @@ export const MENU_STATUS = Object.freeze({
   INACTIVE: 'inactive',
 });
 
+/** Controlled public sort options; arbitrary sort documents are never accepted. */
+export const MENU_SORT_OPTIONS = Object.freeze([
+  'newest',
+  'price-asc',
+  'price-desc',
+]);
+
 const MAX_PRICE = 10_000;
+const MAX_SEARCH_LENGTH = 100;
 
 /** Fields the server owns. Sending any of these is always a client error. */
 const CREATE_RESERVED_FIELDS = new Set([
@@ -118,6 +126,17 @@ const paginationSchema = z
   })
   .strict();
 
+const publicBrowseSchema = z
+  .object({
+    search: textSchema('Search', 1, MAX_SEARCH_LENGTH).optional(),
+    category: categorySchema.optional(),
+    location: locationSchema.optional(),
+    sort: z.enum(MENU_SORT_OPTIONS).default('newest'),
+    page: z.coerce.number().int().min(1).max(10_000).default(1),
+    limit: z.coerce.number().int().min(1).max(50).default(12),
+  })
+  .strict();
+
 function requireObject(body) {
   if (body === null || body === undefined || Array.isArray(body) || typeof body !== 'object') {
     throw ApiError.badRequest('A JSON object is required.', 'INVALID_BODY');
@@ -161,4 +180,21 @@ export function validateMenuUpdate(body) {
 /** Strict query validation prevents operator objects reaching MongoDB. */
 export function validateMenuPagination(query) {
   return paginationSchema.parse(query ?? {});
+}
+
+/**
+ * Escape every regex metacharacter so a search string is always a literal
+ * phrase. The escaped value is safe to pass to MongoDB as `$regex`.
+ */
+export function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Only the documented public query keys are accepted. Unknown keys (including
+ * MongoDB operators such as `where[$ne]`) fail with the normal Zod error, which
+ * the central error handler maps to `400 VALIDATION_ERROR`.
+ */
+export function validatePublicMenuQuery(query) {
+  return publicBrowseSchema.parse(query ?? {});
 }

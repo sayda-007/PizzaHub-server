@@ -8,8 +8,10 @@ import { getMenuItemsCollection } from '../../database/collections.js';
 import { ApiError } from '../../utils/api-error.js';
 import {
   MENU_STATUS,
+  escapeRegex,
   validateMenuPagination,
   validateMenuUpdate,
+  validatePublicMenuQuery,
 } from './menu.validator.js';
 
 const OBJECT_ID_PATTERN = /^[0-9a-f]{24}$/i;
@@ -21,6 +23,19 @@ const SLOT_MENU_STATUSES = Object.freeze([MENU_STATUS.PENDING, MENU_STATUS.APPRO
 const LIMIT_MESSAGE =
   `Free plan allows ${FREE_MENU_ITEM_LIMIT} active menu items. ` +
   'Upgrade to Premium or make an item unavailable to add another.';
+
+/** Public browse never reads vendor-owned or moderation fields into the API. */
+export const PUBLIC_MENU_PROJECTION = Object.freeze({
+  vendorId: 0,
+  status: 0,
+  isAvailable: 0,
+});
+
+const PUBLIC_MENU_SORTS = Object.freeze({
+  newest: Object.freeze({ createdAt: -1, _id: -1 }),
+  'price-asc': Object.freeze({ price: 1, createdAt: -1, _id: -1 }),
+  'price-desc': Object.freeze({ price: -1, createdAt: -1, _id: -1 }),
+});
 
 function toTimestamp(value) {
   const timestamp = value instanceof Date ? value.getTime() : new Date(value).getTime();
@@ -93,6 +108,38 @@ export function buildSlotFilter(vendorId, excludeId) {
   return filter;
 }
 
+/**
+ * Build the only filter used by public browsing. Visibility is server-owned:
+ * a client cannot widen it with query keys, operators or a status parameter.
+ */
+export function buildPublicMenuFilter(options) {
+  const filter = {
+    status: MENU_STATUS.APPROVED,
+    isAvailable: true,
+  };
+
+  if (options.search) {
+    // escapeRegex() makes the user text literal, so characters like `.*` or
+    // `(|)` cannot become regex syntax or a ReDoS pattern.
+    const pattern = escapeRegex(options.search);
+
+    filter.$or = [
+      { itemName: { $regex: pattern, $options: 'i' } },
+      { description: { $regex: pattern, $options: 'i' } },
+    ];
+  }
+
+  if (options.category) {
+    filter.category = options.category;
+  }
+
+  if (options.location) {
+    filter.location = options.location;
+  }
+
+  return filter;
+}
+
 function validateStoredImageUrls(imageUrls) {
   if (!Array.isArray(imageUrls) || imageUrls.length === 0) {
     throw ApiError.badRequest('At least one image URL is required.', 'IMAGE_REQUIRED');
@@ -132,6 +179,32 @@ export function serializeMenu(document) {
     images: Array.isArray(source.images) ? [...source.images] : [],
     status: source.status,
     isAvailable: source.isAvailable !== false,
+    createdAt: source.createdAt,
+  };
+
+  if (Object.hasOwn(source, 'updatedAt')) {
+    result.updatedAt = source.updatedAt;
+  }
+
+  return result;
+}
+
+/**
+ * Public listing uses a narrower shape than vendor listing. Vendor ids,
+ * moderation status and availability flags are internal and are also removed
+ * by PUBLIC_MENU_PROJECTION at the database boundary.
+ */
+export function serializePublicMenu(document) {
+  const source = document && typeof document === 'object' ? document : {};
+  const id = source._id?.toString?.() ?? source.id;
+  const result = {
+    id: id === undefined || id === null ? undefined : String(id),
+    itemName: source.itemName,
+    category: source.category,
+    description: source.description,
+    price: source.price,
+    location: source.location,
+    images: Array.isArray(source.images) ? [...source.images] : [],
     createdAt: source.createdAt,
   };
 
@@ -263,6 +336,34 @@ export function createMenuService(dependencies = {}) {
     };
   }
 
+  async function listPublic(query) {
+    const options = validatePublicMenuQuery(query);
+    const filter = buildPublicMenuFilter(options);
+    const sort = { ...PUBLIC_MENU_SORTS[options.sort] };
+    const collection = getCollection();
+
+    const [totalItems, documents] = await Promise.all([
+      collection.countDocuments(filter),
+      collection
+        .find(filter)
+        .project(PUBLIC_MENU_PROJECTION)
+        .sort(sort)
+        .skip((options.page - 1) * options.limit)
+        .limit(options.limit)
+        .toArray(),
+    ]);
+
+    return {
+      items: documents.map(serializePublicMenu),
+      pagination: {
+        page: options.page,
+        limit: options.limit,
+        totalItems,
+        totalPages: totalItems === 0 ? 0 : Math.ceil(totalItems / options.limit),
+      },
+    };
+  }
+
   async function update(vendorId, id, body) {
     const validatedUpdate = validateMenuUpdate(body);
     const set = buildMenuUpdateSet(validatedUpdate);
@@ -335,6 +436,7 @@ export function createMenuService(dependencies = {}) {
   return Object.freeze({
     assertCanCreate,
     create,
+    listPublic,
     listMine,
     update,
     toggleAvailability,

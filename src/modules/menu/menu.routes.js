@@ -11,11 +11,12 @@ import { createMenuController } from './menu.controller.js';
 import { createMenuService } from './menu.service.js';
 
 /**
- * Vendor-only menu management routes.
+ * Public browsing plus vendor-only menu management routes.
  *
- * Authentication and role checks run before Multer, so unauthenticated users
- * never make the server parse their upload. The parser middleware is scoped to
- * POST / only; no global file upload middleware exists in the application.
+ * GET / is public and exact, so static paths such as /mine are never captured
+ * by it. Management routes keep authentication and role checks before Multer,
+ * so unauthenticated users never make the server parse their upload. The
+ * parser middleware is scoped to POST / only; no global upload middleware exists.
  */
 export function createMenuRoutes(env, dependencies = {}) {
   const authenticate = dependencies.authenticate ?? createAuthenticate(env);
@@ -35,6 +36,11 @@ export function createMenuRoutes(env, dependencies = {}) {
 
   router.post('/', authenticate, vendorOnly, uploadMiddleware, controller.create);
   router.get('/mine', authenticate, vendorOnly, controller.listMine);
+
+  // Exact path only. /mine is registered above and guarded; it cannot be
+  // handled by this public route even though both start with `/`.
+  router.get('/', controller.listPublic);
+
   router.patch('/:id/availability', authenticate, vendorOnly, controller.toggleAvailability);
   router.patch('/:id', authenticate, vendorOnly, controller.update);
   router.delete('/:id', authenticate, vendorOnly, controller.remove);
