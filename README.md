@@ -2,7 +2,7 @@
 
 PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, and the Admin seed script are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Menu, order, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, and vendor menu management with ImgBB uploads are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Public browsing, orders, dashboard and payment APIs are deliberately not implemented yet; the middleware is ready for those routes.
 
 ---
 
@@ -37,15 +37,17 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - `GET /api/users/me` for the current user's safe profile
 - `PATCH /api/users/me` for `name`, `image`, and vendor-only `businessName`
 - Idempotent, server-only Admin seed that uses Better Auth's password hashing
+- Vendor-only menu create, list, update, availability toggle and delete APIs
+- Ownership checks inside every MongoDB menu query
+- ImgBB image uploads through Multer memory storage and built-in `fetch`
 
 **Planned (later milestones)**
 
-- Vendor menu CRUD, availability, and subscription limits
+- Free/Premium menu item limits
 - Public menu browsing with search, filters, sorting, and pagination
 - Customer and vendor order workflows
 - Admin dashboard, moderation, and user management
 - Stripe premium subscription checkout and verified webhooks
-- ImgBB image uploads and server-side validation
 - Integration tests and deployment documentation
 
 ## Technology stack
@@ -58,6 +60,7 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | Database | MongoDB Atlas via the official `mongodb` Node.js driver |
 | Auth | Better Auth 1.7 with the official MongoDB adapter and JWT plugin |
 | JWT verification | `jose` (`createRemoteJWKSet` + `jwtVerify`) |
+| Image uploads | Multer memory storage + ImgBB API v1 with built-in `fetch` |
 | Payments | Stripe Checkout + webhooks (from Milestone 13) |
 | Validation | Zod |
 
@@ -74,8 +77,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 | `better-auth` | Authentication hosted inside Express; JWT plugin from `better-auth/plugins` |
 | `@better-auth/mongo-adapter` | Official adapter that reuses the existing `Db` and `MongoClient` |
 | `jose` | Remote JWKS resolution and JWT signature/claim verification |
+| `multer` | Parses multipart image uploads into memory for ImgBB |
 
-Nine runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest.
+Ten runtime packages are installed at this point. Node 24's built-in `--env-file-if-exists` and `--watch` flags remove the need for `dotenv` and `nodemon`, and we use Node's built-in test runner instead of adding Jest. ImgBB uses built-in `fetch`, `FormData` and `Blob`, so no HTTP client package was added.
 
 ## Project structure
 
@@ -106,24 +110,33 @@ server/
     │   └── rate-limit.js              # shared API limiter
     ├── utils/
     │   └── api-error.js               # ApiError class + status helpers
+    ├── services/
+    │   └── imgbb.js                   # Multer limits + ImgBB upload client
     ├── scripts/
     │   └── seed-admin.js              # manual Admin seed via Better Auth
     ├── tests/
     │   ├── auth.test.js               # JWT, authentication and role tests
     │   ├── error.test.js              # focused error-handler tests
     │   ├── user.test.js               # profile endpoint tests with fakes
-    │   └── seed-admin.test.js         # seed tests with mocks + in-memory auth
+    │   ├── seed-admin.test.js         # seed tests with mocks + in-memory auth
+    │   ├── imgbb.test.js              # upload validation with injected fetch
+    │   └── menu.test.js               # vendor menu API with fake collections
     └── modules/
         ├── health/
         │   └── health.routes.js       # GET /api/health
-        └── user/
-            ├── user.routes.js         # /api/users/me routing
-            ├── user.controller.js     # Express handlers and safe JSON
-            ├── user.service.js        # explicit $set updates + reload
-            └── user.validator.js      # Zod profile validation
+        ├── user/
+        │   ├── user.routes.js         # /api/users/me routing
+        │   ├── user.controller.js     # Express handlers and safe JSON
+        │   ├── user.service.js        # explicit $set updates + reload
+        │   └── user.validator.js      # Zod profile validation
+        └── menu/
+            ├── menu.routes.js         # vendor-only routing + scoped Multer
+            ├── menu.controller.js     # request/response handling
+            ├── menu.service.js        # ownership-aware MongoDB queries
+            └── menu.validator.js      # Zod body and pagination validation
 ```
 
-Planned folders: `modules/{menu,browse,order,admin,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
+Planned folders: `modules/{browse,order,admin,payment}/` and `routes/`. They will be added in the milestone that uses them so the repository contains no empty placeholders.
 
 ## Installation and local setup
 
@@ -209,7 +222,7 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 | `{ status: 1, createdAt: -1 }` | Admin filtering by payment status. |
 | `{ createdAt: -1 }` | Admin listing of all transactions, newest first. |
 
-There is no separate `isAvailable` field: the assignment's `status` values (`pending`, `approved`, `rejected`, `inactive`) control public visibility. If the three obsolete indexes containing `isAvailable` exist from an earlier run, initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched.
+`isAvailable` is now a vendor-controlled boolean, but its old compound indexes were from a different design and are still removed: initialization verifies their exact key definitions and drops only those three; `_id` and every unrelated index are left untouched. Vendor listing uses the existing `{ vendorId: 1, createdAt: -1 }` index. Public visibility will still combine an Admin-approved `status` (`approved`) with availability when public browsing is implemented in a later milestone.
 
 No text index or price index is created yet: those serve search/sort endpoints that are not implemented until a later milestone. The `_id` index is provided automatically by MongoDB.
 
@@ -222,13 +235,13 @@ No text index or price index is created yet: those serve search/sort endpoints t
 3. **Rate limiter** — rejects abusive clients before their bodies are parsed.
 4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
 5. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
-6. **Feature routers** — currently `/api/health` and `/api/users`; later modules mount under `/api`.
+6. **Feature routers** — currently `/api/health`, `/api/users` and `/api/menu`; later modules mount under `/api`.
 7. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
 8. **Error handler** — always last, so it catches errors from every earlier layer.
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
-`authenticate` is mounted explicitly on `/api/users/me`. `requireRole(...)` remains ready for future role-specific business routes, for example `app.delete('/api/menu/:id', authenticate, requireRole('vendor'), handler)`. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
+`authenticate` is mounted explicitly on `/api/users/me` and every `/api/menu` route. `requireRole('vendor')` runs after authentication on all menu routes. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
 
 ## Error responses
 
@@ -271,8 +284,13 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `POST` | `/api/auth/sign-out` | Session | Ends the session |
 | `GET` | `/api/users/me` | Bearer JWT | Returns the current user's safe profile |
 | `PATCH` | `/api/users/me` | Bearer JWT | Updates `name`, `image`, and vendor-only `businessName` |
+| `POST` | `/api/menu` | Bearer JWT + Vendor | Creates a pending item with uploaded images |
+| `GET` | `/api/menu/mine` | Bearer JWT + Vendor | Lists only the vendor's own items with pagination |
+| `PATCH` | `/api/menu/:id` | Bearer JWT + Vendor | Updates an owned item |
+| `PATCH` | `/api/menu/:id/availability` | Bearer JWT + Vendor | Toggles `isAvailable` on an owned item |
+| `DELETE` | `/api/menu/:id` | Bearer JWT + Vendor | Deletes an owned item |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*` uses the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*` and `/api/menu/*` use the JWT middleware instead of auth cookies. All other business endpoints belong to later milestones.
 
 ## Environment variables
 
@@ -290,12 +308,12 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 | `STRIPE_SECRET_KEY` | Milestone 13 | Test-mode key during development |
 | `STRIPE_WEBHOOK_SECRET` | Milestone 13 | Verifies webhook signatures |
 | `STRIPE_PRICE_ID` | Milestone 13 | Premium plan price |
-| `IMGBB_API_KEY` | Milestone 7 | Image upload key |
+| `IMGBB_API_KEY` | Vendor menu uploads | Optional at startup; required when a menu image is uploaded; placeholders are rejected |
 | `ADMIN_NAME` | Admin seed script | Required only when running `npm run seed:admin`; placeholders are rejected |
 | `ADMIN_EMAIL` | Admin seed script | Real address required; `example.com`/`example.test` placeholders are rejected |
 | `ADMIN_PASSWORD` | Admin seed script | 6–128 characters with at least one uppercase and one lowercase letter |
 
-`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in stays disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them.
+`PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in is disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them. `IMGBB_API_KEY` is also optional at startup so the server can run without uploads, but a menu image upload returns a safe error until a real key is configured.
 
 ## Authentication architecture
 
@@ -393,6 +411,74 @@ The four files in `src/modules/user/` keep the profile feature small and testabl
 The body is parsed with Zod `.strict()`, so an empty body returns `400 EMPTY_UPDATE`, an unknown field returns `400 VALIDATION_ERROR`, and reserved fields such as `role`, `email`, `isBlocked`, `subscriptionPlan` or `password` return `400 FORBIDDEN_FIELD`. A non-vendor sending `businessName` gets `403 FORBIDDEN_FIELD`.
 
 The service builds `$set` from its own allow-list; `req.body` is never spread into MongoDB. It adds a server-generated `updatedAt`, writes with `updateOne`, then reloads the user and returns the sanitized profile. A blocked user gets `403`, a deleted user gets `401`, and infrastructure failures become generic `500` responses through the centralized handler.
+
+## Vendor menu management
+
+The four files in `src/modules/menu/` keep this feature separate from users and auth. `src/services/imgbb.js` owns upload parsing and ImgBB communication.
+
+### Menu item structure
+
+| Field | Owner | Notes |
+| --- | --- | --- |
+| `vendorId` | Server | Copied from `req.user.id`; never read from the request body |
+| `itemName` | Vendor | Trimmed text, 2–120 characters |
+| `category` | Vendor | One of the fixed categories below |
+| `description` | Vendor | Trimmed text, up to 1000 characters |
+| `price` | Vendor | Positive number, at most two decimal places, maximum `10000` |
+| `location` | Vendor | Trimmed text, up to 120 characters |
+| `images` | ImgBB | Direct URLs returned by a successful upload |
+| `status` | Server | Always `pending` on create; only Admin moderation may change it later |
+| `createdAt` | Server | Set once with `new Date()` |
+| `isAvailable` | Vendor | `true` on create; toggleable by the owning vendor |
+| `updatedAt` | Server | Refreshed on every write; not in the original assignment shape but needed for auditability |
+
+Required categories:
+
+- Classic Pizzas
+- Vegetarian Pizzas
+- Meat Lovers
+- Specialty / Gourmet Pizzas
+- Sides & Appetizers
+- Beverages & Desserts
+
+### Approval and availability
+
+A new item is submitted with `status: 'pending'` and `isAvailable: true`. Pending approval and vendor availability are different ideas:
+
+- `status` is Admin-owned. Vendors cannot set or patch it. Admin moderation is a later milestone.
+- `isAvailable` is vendor-owned. `PATCH /api/menu/:id/availability` flips the current boolean value.
+
+### Request rules
+
+Every endpoint requires `Authorization: Bearer <jwt>` and a MongoDB role of `vendor`. A session cookie is not accepted.
+
+- `POST /api/menu` expects `multipart/form-data`. Text fields are validated with strict Zod; the image files must be in the `images` field. Client-supplied image URL strings are rejected.
+- `GET /api/menu/mine` accepts `page` (default `1`, max `10000`) and `limit` (default `10`, max `50`) and returns `{ items, pagination }`.
+- `PATCH /api/menu/:id` accepts only `itemName`, `category`, `description`, `price`, `location` and `isAvailable`.
+- `PATCH /api/menu/:id/availability` takes no body.
+- `DELETE /api/menu/:id` returns `204` on success.
+
+`vendorId`, `status`, `createdAt`, `updatedAt`, `images`, `_id` and `id` are reserved and rejected with `400 FORBIDDEN_FIELD`. Ids must be canonical 24-character MongoDB ObjectIds (`400 INVALID_MENU_ID` otherwise).
+
+### Ownership
+
+Ownership is enforced in MongoDB, not only in Express. Every update, toggle, read and delete uses a filter shaped like `{ _id: ObjectId(id), vendorId: req.user.id }`. A missing item and another vendor's item both return `404 MENU_ITEM_NOT_FOUND`, so the API never reveals whether someone else's id exists. `vendorId` always comes from the authenticated user, and the service rebuilds `$set` from an allow-list instead of spreading `req.body`.
+
+### ImgBB upload flow and limits
+
+`createImageUploader()` configures Multer with `memoryStorage()` and is mounted only on `POST /api/menu`, after authentication and role checks. The upload service then sends each buffer with Node's built-in `fetch` to `POST https://api.imgbb.com/1/upload` using `FormData`. The API key is sent in the multipart body and is never logged or echoed. Only the `data.url` (or `display_url`) from the successful JSON response is saved.
+
+Safe limits:
+
+| Limit | Value | Reason |
+| --- | --- | --- |
+| Per-file size | 5 MB | Below ImgBB's 32 MB ceiling and safe for memory storage |
+| Files per item | 3 | Keeps one request small and predictable |
+| Text fields | 8 | The create form needs five |
+| Field nesting depth | 1 | Blocks `field[$ne]=...`-style NoSQL injection attempts |
+| MIME types | JPEG, PNG, WebP, GIF | SVG and other types are rejected |
+
+Missing or placeholder credentials produce `500 IMAGE_UPLOAD_UNAVAILABLE`. Multer/ImgBB failures produce safe `400`/`413`/`502` responses with fixed messages. Raw fetch text, response bodies and the API key are never returned.
 
 ## Admin seed script
 
