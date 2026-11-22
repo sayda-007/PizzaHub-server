@@ -27,6 +27,7 @@ export function createAdminMenuRoutes(env, dependencies = {}) {
 
   router.get('/', controller.list);
   router.patch('/:id/status', controller.moderate);
+  router.patch('/:id/availability', controller.setPublishedAvailability);
   router.delete('/:id', controller.remove);
 
   return router;

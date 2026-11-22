@@ -2,11 +2,12 @@ import {
   getMenuItemsCollection,
   getOrdersCollection,
   getTransactionsCollection,
+  getUsersCollection,
 } from './collections.js';
 import { getDb } from './mongo.js';
 
 /**
- * Index definitions for the three business collections.
+ * Index definitions for the four business collections.
  *
  * Explicit names make repeated runs idempotent and prevent accidentally
  * creating two indexes with slightly different specifications. Menu search is
@@ -14,6 +15,16 @@ import { getDb } from './mongo.js';
  * index either.
  */
 const INDEX_DEFINITIONS = Object.freeze([
+  {
+    collection: getUsersCollection,
+    indexes: [
+      // Admin user listing with an optional exact role and newest-first order.
+      { name: 'role_1_createdAt_-1', key: { role: 1, createdAt: -1 } },
+
+      // Admin user listing without a role filter, plus stable newest-first reads.
+      { name: 'createdAt_-1', key: { createdAt: -1 } },
+    ],
+  },
   {
     collection: getMenuItemsCollection,
     indexes: [

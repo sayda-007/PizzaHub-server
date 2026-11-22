@@ -27,6 +27,16 @@ export function createAdminMenuController(service) {
       }
     },
 
+    async setPublishedAvailability(req, res, next) {
+      try {
+        const item = await service.setPublishedAvailability(req.params.id, req.body);
+
+        return res.json({ item });
+      } catch (error) {
+        return next(error);
+      }
+    },
+
     async remove(req, res, next) {
       try {
         await service.remove(req.params.id);

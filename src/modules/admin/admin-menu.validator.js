@@ -41,6 +41,12 @@ const moderationSchema = z
   })
   .strict();
 
+const publishedAvailabilitySchema = z
+  .object({
+    isAvailable: z.boolean(),
+  })
+  .strict();
+
 /** A moderation request owns only the target status, never an item field. */
 const MODERATION_RESERVED_FIELDS = new Set([
   'vendorId',
@@ -58,6 +64,15 @@ const MODERATION_RESERVED_FIELDS = new Set([
   'subscriptionExpiresAt',
   'id',
   '_id',
+]);
+
+/**
+ * Published availability owns only `isAvailable`. `status` is deliberately
+ * reserved here so this route cannot become a second moderation path.
+ */
+const PUBLISHED_AVAILABILITY_RESERVED_FIELDS = new Set([
+  ...[...MODERATION_RESERVED_FIELDS].filter((field) => field !== 'isAvailable'),
+  'status',
 ]);
 
 function requireObject(body) {
@@ -89,4 +104,25 @@ export function validateModerationBody(body) {
   }
 
   return moderationSchema.parse(body);
+}
+
+/**
+ * Admin-only published-item availability control. It accepts exactly
+ * `{ isAvailable: boolean }`; moderation status stays on its own route.
+ */
+export function validatePublishedAvailabilityBody(body) {
+  requireObject(body);
+
+  const reserved = Object.keys(body).filter((key) =>
+    PUBLISHED_AVAILABILITY_RESERVED_FIELDS.has(key),
+  );
+
+  if (reserved.length > 0) {
+    throw ApiError.badRequest(
+      `These fields cannot be set here: ${reserved.join(', ')}.`,
+      'FORBIDDEN_FIELD',
+    );
+  }
+
+  return publishedAvailabilitySchema.parse(body);
 }

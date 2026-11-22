@@ -1,8 +1,8 @@
 # PizzaHub — Backend Server
 
-PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API that will serve a separate Next.js client (to be created later in a different repository).
+PizzaHub is a role-based pizza ordering and delivery platform. This repository contains the **backend only**: a Node.js/Express REST API intended for a separate Next.js client in a different repository.
 
-> **Status: Better Auth, JWT verification, role-based authorization, the `/api/users/me` profile API, the Admin seed script, vendor menu management with ImgBB uploads, Free/Premium menu item limits, public menu browsing, Admin menu moderation, customer/vendor order management, and Stripe Premium subscriptions with verified webhooks are implemented.** The Express foundation, MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting and collection/index setup are also in place. Admin dashboard/user APIs are deliberately not implemented yet; the middleware is ready for those routes.
+> **Status: the Assignment 9 backend is complete.** It includes Better Auth, JWT verification, role-based authorization, profile and Admin seed APIs, vendor menu management with ImgBB uploads, Free/Premium menu limits, public browsing, Admin menu moderation and published-item availability control, customer/vendor order workflows, Stripe Premium subscriptions with verified webhooks, Admin dashboard statistics, Admin user management/blocking, and read-only Admin transaction listing. The MongoDB Atlas connection, shared utilities, centralized error handling, 404 handling, rate limiting, tests and collection/index setup are in place.
 
 ---
 
@@ -21,7 +21,7 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - MongoDB Atlas connection with the official driver, selected by `MONGODB_DB_NAME`
 - Startup blocked until MongoDB responds to a ping
 - Sanitized database errors that never print the connection string or credentials
-- Centralized collection names and accessors for the three business collections
+- Centralized collection names and accessors for the four business collections (`users`, `menuItems`, `orders`, `transactions`)
 - Idempotent index initialization before the HTTP listener starts
 - Health-check endpoint
 - Reusable `ApiError` class carrying a safe message, HTTP status and error code
@@ -41,7 +41,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Public menu browsing with validated search, filters, sorting and pagination
 - Ownership checks inside every MongoDB menu query
 - Server-side Free/Premium menu item limits with pending items reserving slots
-- Admin-only menu listing, approval, rejection and deletion
+- Admin-only menu listing, approval, rejection, published-item availability control and deletion
+- Admin dashboard counts, paginated user management and idempotent user blocking
+- Read-only Admin transaction listing with validation and safe projections
 - Customer order placement, owned listing/details, and pending-order cancellation
 - Vendor order listing and single-use accept/reject decisions
 - Atomic duplicate-active-order protection with a unique partial MongoDB index
@@ -49,10 +51,9 @@ Customers will browse approved pizza menus and place orders. Vendors will manage
 - Period-end cancellation, Premium expiry, payment transactions and menu-slot synchronization
 - ImgBB image uploads through Multer memory storage and built-in `fetch`
 
-**Planned (later milestones)**
+**Outside this repository**
 
-- Admin dashboard and user management
-- Integration tests and deployment documentation
+- The separate Next.js client is not part of this backend assignment.
 
 ## Technology stack
 
@@ -128,15 +129,20 @@ server/
     │   ├── imgbb.test.js              # upload validation with injected fetch
     │   ├── menu.test.js               # vendor menu API with fake collections
     │   ├── admin-menu.test.js         # admin moderation API with fake collections
+    │   ├── admin.test.js              # dashboard, users, blocking, transactions, webhook regression
     │   ├── order.test.js              # customer/vendor order APIs with fakes
     │   ├── indexes.test.js            # safe index error-message tests
     │   └── subscription.test.js       # fake Stripe subscription/webhook tests
     └── modules/
         ├── admin/
-        │   ├── admin-menu.routes.js   # authenticated admin-only routing
+        │   ├── admin-menu.routes.js   # admin menu routing + availability route
         │   ├── admin-menu.controller.js # request/response handling
-        │   ├── admin-menu.service.js  # all-status listing and status-only writes
-        │   └── admin-menu.validator.js # Zod query and moderation validation
+        │   ├── admin-menu.service.js  # listing, moderation, published availability, deletion
+        │   ├── admin-menu.validator.js # Zod query, moderation and availability validation
+        │   ├── admin.routes.js        # dashboard/user/transaction admin routing
+        │   ├── admin.controller.js    # request/response handling
+        │   ├── admin.service.js       # count queries, safe reads, conditional block writes
+        │   └── admin.validator.js     # strict query, id and body validation
         ├── health/
         │   └── health.routes.js       # GET /api/health
         ├── user/
@@ -161,7 +167,7 @@ server/
             └── payment.validator.js   # strict no-input body validation
 ```
 
-Planned folder: `modules/browse/`. It will be added in the milestone that uses it so the repository contains no empty placeholders.
+Every folder above contains implementation files; no empty placeholder modules are present.
 
 ## Installation and local setup
 
@@ -218,6 +224,15 @@ If the connection fails, the process logs a fixed, descriptive message and exits
 
 `src/database/indexes.js` creates indexes with explicit, fixed names, so running it repeatedly is safe. It runs after the connection ping and before `app.listen()`. A failure produces a sanitized message, closes the pool and exits with status `1`. Unique-index failures name the index and explain that no data was changed and the conflicting documents must be resolved manually before restarting; startup does not continue without the duplicate guard.
 
+### `users`
+
+| Index | Purpose |
+| --- | --- |
+| `{ role: 1, createdAt: -1 }` | Admin user listing with an exact role filter, newest first. |
+| `{ createdAt: -1 }` | Admin user listing without a role filter and stable newest-first reads. |
+
+Dashboard counts and user/transaction pages use `countDocuments()` plus MongoDB `skip()`/`limit()`; no whole collection is loaded into Express. Better Auth still owns its `session`, `account`, `verification` and `jwks` collections; the Admin APIs only read allow-listed user fields and write the server-owned `isBlocked` boolean.
+
 ### `menuItems`
 
 | Index | Purpose |
@@ -265,13 +280,13 @@ Order writes use the existing `orders` collection only. The new unique partial i
 4. **Better Auth handler** — `app.all('/api/auth/*splat', toNodeHandler(auth))`. It must come before `express.json()` because it reads the raw request stream. The `*splat` name is required by Express 5's path-to-regexp v8.
 5. **Stripe webhook** — `POST /api/webhooks/stripe` uses `express.raw({ type: 'application/json' })` before the global JSON parser. Stripe signs exact bytes, so the signature is verified against the raw buffer.
 6. **express.json** — parses JSON bodies up to 1 MB for the API's own routes.
-7. **Feature routers** — currently `/api/health`, `/api/users`, `/api/menu`, `/api/admin/menu`, `/api/orders`, `/api/vendor/orders` and `/api/vendor/subscription`.
+7. **Feature routers** — `/api/health`, `/api/users`, `/api/menu`, `/api/admin/menu`, `/api/admin`, `/api/orders`, `/api/vendor/orders` and `/api/vendor/subscription`.
 8. **404 middleware** — turns unmatched routes into an `ApiError(404)`.
 9. **Error handler** — always last, so it catches errors from every earlier layer.
 
 Better Auth writes its own JSON responses; the centralized error handler still owns all non-auth routes.
 
-`authenticate` is mounted explicitly on `/api/users/me`, every vendor management route under `/api/menu`, and the whole `/api/admin/menu` router. `GET /api/menu` is the only public menu route; its exact path does not capture `/mine`, which keeps its own auth and vendor guards. `requireRole('vendor')` runs after authentication on vendor management routes, while `requireRole('admin')` runs after authentication on every admin menu route. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
+`authenticate` is mounted explicitly on `/api/users/me`, every vendor management route under `/api/menu`, and the whole `/api/admin/menu` and `/api/admin` routers. `GET /api/menu` is the only public menu route; its exact path does not capture `/mine`, which keeps its own auth and vendor guards. `requireRole('vendor')` runs after authentication on vendor management routes, while `requireRole('admin')` runs after authentication on every Admin route. Multer is mounted only on `POST /api/menu`, and only after those two guards, so unauthenticated clients cannot make the server parse their files. Nothing is mounted globally, Better Auth's catch-all still runs first, and no public test-only auth route was added to the production API.
 
 ## Error responses
 
@@ -322,7 +337,14 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `DELETE` | `/api/menu/:id` | Bearer JWT + Vendor | Deletes an owned item |
 | `GET` | `/api/admin/menu` | Bearer JWT + Admin | Lists every menu item with admin-safe fields |
 | `PATCH` | `/api/admin/menu/:id/status` | Bearer JWT + Admin | Approves or rejects a pending item |
+| `PATCH` | `/api/admin/menu/:id/availability` | Bearer JWT + Admin | Deactivates or reactivates a published item |
 | `DELETE` | `/api/admin/menu/:id` | Bearer JWT + Admin | Deletes any menu item |
+| `GET` | `/api/admin/dashboard/stats` | Bearer JWT + Admin | Returns the six dashboard counts |
+| `GET` | `/api/admin/users` | Bearer JWT + Admin | Lists users with search, role filter and pagination |
+| `GET` | `/api/admin/users/:id` | Bearer JWT + Admin | Reads one user's safe fields |
+| `PATCH` | `/api/admin/users/:id/block` | Bearer JWT + Admin | Sets the server-owned `isBlocked` flag |
+| `PATCH` | `/api/admin/users/:id/unblock` | Bearer JWT + Admin | Clears the server-owned `isBlocked` flag |
+| `GET` | `/api/admin/transactions` | Bearer JWT + Admin | Reads paginated payment records; no writes exist |
 | `POST` | `/api/orders` | Bearer JWT + Customer | Places an order from an approved, available item |
 | `GET` | `/api/orders/mine` | Bearer JWT + Customer | Lists only the customer's own orders |
 | `GET` | `/api/orders/:id` | Bearer JWT + Customer | Reads one of the customer's own orders |
@@ -334,7 +356,7 @@ Rate limiting has no dedicated environment variable. Authentication variables ar
 | `POST` | `/api/vendor/subscription/cancel` | Bearer JWT + Vendor | Cancels at the current Stripe period end |
 | `POST` | `/api/webhooks/stripe` | Public, signed | Verifies Stripe signatures and synchronizes Premium state |
 
-Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing), `/api/admin/menu/*`, `/api/orders/*`, `/api/vendor/orders/*` and `/api/vendor/subscription/*` use the JWT middleware instead of auth cookies. `/api/webhooks/stripe` is public by design but is never trusted without a valid Stripe signature. All other business endpoints belong to later milestones.
+Better Auth owns every `/api/auth/*` route; the table lists the ones used in this project. `/api/users/*`, `/api/menu/*` (except public browsing), `/api/admin/menu/*`, `/api/admin/*`, `/api/orders/*`, `/api/vendor/orders/*` and `/api/vendor/subscription/*` use the JWT middleware instead of auth cookies. `/api/webhooks/stripe` is public by design but is never trusted without a valid Stripe signature. There are no unlisted business endpoints.
 
 ## Environment variables
 
@@ -487,10 +509,10 @@ Required categories:
 
 ### Approval and availability
 
-A new item is submitted with `status: 'pending'` and `isAvailable: true`. Pending approval and vendor availability are different ideas:
+A new item is submitted with `status: 'pending'` and `isAvailable: true`. Pending approval and availability are different ideas:
 
 - `status` is Admin-owned. Vendors cannot set or patch it. Only `PATCH /api/admin/menu/:id/status` can move a pending item to `approved` or `rejected`.
-- `isAvailable` is vendor-owned. `PATCH /api/menu/:id/availability` flips the current boolean value.
+- `isAvailable` controls public visibility. The owning vendor flips it with `PATCH /api/menu/:id/availability`; an Admin may deactivate or reactivate only an already published (`approved`) item with `PATCH /api/admin/menu/:id/availability`. Neither route changes `status`.
 
 ### Subscription item limits
 
@@ -572,6 +594,82 @@ The response uses the same pagination shape as public browsing, with `items`, `p
 Approval only changes moderation status. Pending and approved items both consume a free-plan slot, so approval does not create an extra slot or bypass subscription limits. An approved item appears in public browsing only if its vendor has also made it available; a rejected item never appears publicly.
 
 `DELETE /api/admin/menu/:id` validates the ObjectId and deletes any owned or unowned menu item with `deleteOne`. It returns `204` on success and `404 MENU_ITEM_NOT_FOUND` when nothing was deleted. It does not call or introduce an image-storage service, so remote ImgBB cleanup remains a later concern.
+
+### Published-item availability
+
+`PATCH /api/admin/menu/:id/availability` accepts exactly `{ "isAvailable": true }` or `{ "isAvailable": false }`. It operates on the existing availability boolean; it does not introduce another status field and never changes `status`, `vendorId`, `price`, item details or timestamps beyond `updatedAt`.
+
+- Only an `approved` item may be changed. Pending, rejected and inactive items return `409 MENU_ITEM_NOT_PUBLISHED`.
+- A malformed id returns `400 INVALID_MENU_ID`; a missing item returns `404 MENU_ITEM_NOT_FOUND`.
+- `status` and every reserved/unknown body field return `400 FORBIDDEN_FIELD` or `400 VALIDATION_ERROR`. This keeps the Admin availability route separate from pending moderation.
+- Repeated calls with the same value are idempotent: the boolean is already correct, so no `$set` write is issued.
+- Reactivating an unavailable item for a free vendor still enforces the three-slot limit and returns `409 MENU_ITEM_LIMIT_REACHED` when the vendor already has three active/reserved items.
+
+The response is `{ "item": … }` with the same `serializeMenu()` allow-list used by the other menu routes.
+
+## Admin dashboard, users and transactions
+
+The files `admin.routes.js`, `admin.controller.js`, `admin.service.js` and `admin.validator.js` add the remaining Admin features. The router mounts `authenticate` and `requireRole('admin')` once, so every route below resolves the role from the current MongoDB user record; JWT role claims are ignored. Missing credentials return `401 UNAUTHORIZED`, and customers/vendors return `403 FORBIDDEN`. A blocked Admin is rejected by `authenticate` before authorization.
+
+### Dashboard statistics
+
+`GET /api/admin/dashboard/stats` takes no parameters and returns:
+
+```json
+{
+  "stats": {
+    "totalUsers": 6,
+    "totalVendors": 2,
+    "totalCustomers": 2,
+    "totalMenuItems": 3,
+    "pendingMenuItems": 1,
+    "totalTransactions": 3
+  }
+}
+```
+
+All six values come from separate `countDocuments()` calls with server-built filters. `totalUsers` counts every role, including admins; `totalVendors` and `totalCustomers` use exact role equality. Empty collections return `0`, never `null`. No full collection is loaded and no private user, menu or payment field is returned.
+
+### User management
+
+`GET /api/admin/users` supports `search`, `role`, `page` and `limit`:
+
+| Parameter | Validation | Behavior |
+| --- | --- | --- |
+| `search` | Optional trimmed string, 1–100 characters, no control characters | Escaped case-insensitive literal regex over `name` and `email`. Regex metacharacters and operator objects cannot reach MongoDB. |
+| `role` | Optional exact `customer`, `vendor` or `admin` | Equality filter; all three roles are supported. |
+| `page` | Integer, 1–10000, default `1` | Applied with MongoDB `skip()`. |
+| `limit` | Integer, 1–50, default `12` | Applied with MongoDB `limit()`. |
+
+The response is `{ "users": [...], "pagination": { "page", "limit", "totalItems", "totalPages" } }`, newest first. `GET /api/admin/users/:id` returns `{ "user": ... }`; malformed ids return `400 INVALID_USER_ID` and unknown ids return `404 USER_NOT_FOUND`.
+
+Both responses use an inclusion projection plus an explicit serializer. The only fields returned are `id`, `name`, `email`, `image`, `role`, `businessName`, `isBlocked`, `subscriptionPlan`, `subscriptionStatus`, `subscriptionExpiresAt`, `createdAt` and `updatedAt`. Password hashes, reset/session tokens, Better Auth accounts and every other private field are excluded. Zod `.strict()` rejects unknown and operator-shaped query keys with `400 VALIDATION_ERROR`.
+
+### Blocking rules
+
+`PATCH /api/admin/users/:id/block` and `PATCH /api/admin/users/:id/unblock` accept an empty JSON object only. They set exactly one server-owned field, `isBlocked`, plus `updatedAt`; roles, subscriptions, payment fields, menu/order data, ids and timestamps cannot be supplied in the body and are rejected with `400 FORBIDDEN_FIELD` or `400 VALIDATION_ERROR`.
+
+- The target must be a canonical 24-character id that exists; otherwise `400 INVALID_USER_ID` or `404 USER_NOT_FOUND`.
+- An Admin cannot block themselves: `400 SELF_BLOCK_NOT_ALLOWED`. Admin accounts cannot be blocked or unblocked by anyone: `403 ADMIN_ACCOUNT_PROTECTED`.
+- The `updateOne()` filter also requires `role: { $ne: 'admin' }` and `isBlocked: { $ne: <target value> }`. Repeating a decision does not write again and returns the current safe user.
+- Blocked customers and vendors receive `403 FORBIDDEN` with the fixed message `This account is blocked.` on every authenticated route, including profile, menu, order and subscription APIs.
+- Blocking does not touch menu items, orders, transactions, subscription fields or Stripe. Verified Stripe webhooks intentionally continue to process billing events for a blocked vendor; no Admin endpoint changes payment state.
+
+### Read-only transactions
+
+`GET /api/admin/transactions` supports only `status`, `vendorId`, `fromDate`, `toDate`, `page` and `limit`:
+
+| Parameter | Validation | Behavior |
+| --- | --- | --- |
+| `status` | Optional exact `pending`, `paid` or `failed` | Equality on the existing transaction `status`/payment-status vocabulary. |
+| `vendorId` | Optional canonical 24-character hexadecimal id | Equality on `vendorId`. |
+| `fromDate` / `toDate` | Optional real `YYYY-MM-DD` calendar dates | Inclusive UTC day range on `createdAt`; `toDate` must not precede `fromDate`. |
+| `page` | Integer, 1–10000, default `1` | Applied with MongoDB `skip()`. |
+| `limit` | Integer, 1–50, default `12` | Applied with MongoDB `limit()`. |
+
+Results are newest first with `{ createdAt: -1, _id: -1 }`. The response is `{ "transactions": [...], "pagination": { ... } }`. The serializer returns only `id`, `vendorId`, `amount`, `currency`, `paymentStatus`, `status`, the Stripe session/checkout/invoice/subscription/event identifiers and timestamps. Card numbers, CVCs and panel data are never stored by this backend and are never returned. Existing `pending`, `paid` and `failed` records remain distinguishable; the Admin API does not normalize or rewrite them.
+
+This route is strictly `GET`. There is no Admin endpoint to create, update, refund, delete or mark a transaction successful. `POST`, `PATCH`, `PUT` and `DELETE` under `/api/admin/transactions` are unmatched routes handled by the 404 middleware, and the existing Stripe webhook remains the only writer of transaction state.
 
 ## Customer and vendor orders
 
@@ -717,17 +815,40 @@ Counting and page retrieval both run in MongoDB with the same filter; the whole 
 
 `updatedAt` appears in an item only when the stored document has it. The public route is exact: `/api/menu/mine` still reaches its authenticated vendor-only handler instead of the public handler.
 
-## Stripe webhooks
+## Stripe webhook setup (test mode)
 
-Stripe will be used only for vendor premium subscriptions, never for pizza orders. The webhook route will use the raw request body, verify signatures, be idempotent, and be the only place that activates Premium — the success redirect will never be trusted. Details will be added in Milestone 13.
+Stripe is used only for vendor Premium subscriptions, never for pizza orders. The success redirect is never trusted: Premium is activated only by a signed webhook.
+
+1. Use **test mode** locally. Put a test secret key (`sk_test_...`) in `STRIPE_SECRET_KEY`, a test recurring Price ID (`price_...`) in `STRIPE_PREMIUM_PRICE_ID`, and the signing secret in `STRIPE_WEBHOOK_SECRET`. All three must be real together or all omitted/placeholder together.
+2. For local development, run the Stripe CLI listener and copy the printed `whsec_...` value into `STRIPE_WEBHOOK_SECRET`:
+
+   ```powershell
+   stripe listen --forward-to localhost:5000/api/webhooks/stripe
+   ```
+
+   Send test events with `stripe trigger checkout.session.completed` or the Dashboard's test event sender. The Stripe CLI is a developer tool, not a project dependency.
+3. In production, register `https://<your-api-domain>/api/webhooks/stripe` in the Stripe Dashboard, subscribe to `checkout.session.completed`, `invoice.paid`, `invoice.payment_failed`, `customer.subscription.updated` and `customer.subscription.deleted`, and use that endpoint's signing secret. The route requires HTTPS behind the reverse proxy and verifies exact raw bytes with `Stripe-Signature`.
+4. Tests use the SDK's `generateTestHeaderString()` with fake local secrets and an injected fake Stripe client. No real payment, external request or Atlas write occurs.
 
 ## Deployment
 
-Deployment instructions will be added after the backend is complete. The intended shape is a Node process behind a reverse proxy, with all secrets supplied through environment variables and no credentials in source control.
+Run one Node 22.9+ process behind an HTTPS reverse proxy. The API does not serve the frontend; `CLIENT_URL` is the trusted browser origin used by CORS and Checkout redirects, while `BETTER_AUTH_URL` is this API's public URL and the JWT issuer/audience. Both must match the deployed origins, and cross-origin cookies/auth require HTTPS in production.
+
+Supply every secret through environment variables or the platform's secret manager: `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `CLIENT_URL`, the three Stripe values, and optionally `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` and `IMGBB_API_KEY`. Never commit `.env`; only `.env.example` is tracked. Restart with a real Admin password after running the manual `npm run seed:admin` step; the server itself never creates an Admin.
+
+Safe startup expectations:
+
+1. `loadEnv()` validates configuration first. Placeholder Stripe/Google values are ignored with a warning; partial real integrations are startup errors.
+2. `connectToDatabase()` pings MongoDB before the HTTP listener opens. Raw connection errors are never logged or returned.
+3. `ensureIndexes()` then creates the fixed indexes idempotently. Duplicate-index conflicts stop startup, name the index and require manual resolution; no records are modified or deleted. The unique transaction indexes and the partial unique active-order index are preserved.
+4. Only then does `app.listen(PORT)` run. `/api/health` is a pure liveness probe; graceful shutdown closes the HTTP server and shared Mongo pool.
+5. For Atlas, add the deployment host's IP to Network Access and URL-encode special characters in `MONGODB_URI`.
+
+The limiter uses an in-process store, so a multi-instance deployment should add a shared store before relying on global rate limits. Use `npm run check` and `npm test` in CI; both are offline and need neither MongoDB nor Stripe credentials.
 
 ## Client repository
 
-To be added later.
+The Next.js client is a separate repository and is outside this backend assignment. This repository contains no frontend or TypeScript source.
 
 ## License
 

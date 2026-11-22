@@ -1,7 +1,11 @@
-import { getMenuItemsCollection } from '../../database/collections.js';
+import { getMenuItemsCollection, getUsersCollection } from '../../database/collections.js';
+import { buildUserIdFilter } from '../../middlewares/authenticate.js';
 import { ApiError } from '../../utils/api-error.js';
 import {
+  FREE_MENU_ITEM_LIMIT,
   buildMenuIdFilter,
+  buildSlotFilter,
+  isPremiumSubscription,
   serializeMenu,
 } from '../menu/menu.service.js';
 import {
@@ -11,6 +15,7 @@ import {
 import {
   validateAdminMenuQuery,
   validateModerationBody,
+  validatePublishedAvailabilityBody,
 } from './admin-menu.validator.js';
 
 /**
@@ -74,6 +79,7 @@ export function buildAdminMenuFilter(options) {
  */
 export function createAdminMenuService(dependencies = {}) {
   const collectionSource = dependencies.collection;
+  const usersSource = dependencies.usersCollection ?? dependencies.users;
   const now = dependencies.now ?? (() => new Date());
 
   function getCollection() {
@@ -82,6 +88,14 @@ export function createAdminMenuService(dependencies = {}) {
     }
 
     return collectionSource ?? getMenuItemsCollection();
+  }
+
+  function getUsers() {
+    if (typeof usersSource === 'function') {
+      return usersSource();
+    }
+
+    return usersSource ?? getUsersCollection();
   }
 
   async function listAdmin(query) {
@@ -149,6 +163,76 @@ export function createAdminMenuService(dependencies = {}) {
     return serializeMenu(updated);
   }
 
+  /**
+   * Published availability is separate from pending approval/rejection. Only an
+   * approved item can be hidden or restored, and restoring a free vendor's item
+   * cannot exceed the same three-slot limit enforced for vendor writes.
+   */
+  async function setPublishedAvailability(id, body) {
+    const isAvailable = validatePublishedAvailabilityBody(body).isAvailable;
+    const idFilter = buildMenuIdFilter(id);
+    const collection = getCollection();
+    const existing = await collection.findOne(idFilter);
+
+    if (!existing) {
+      throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    if (existing.status !== MENU_STATUS.APPROVED) {
+      throw ApiError.conflict(
+        'Only published menu items can have Admin availability changed.',
+        'MENU_ITEM_NOT_PUBLISHED',
+      );
+    }
+
+    if ((existing.isAvailable !== false) === isAvailable) {
+      return serializeMenu(existing);
+    }
+
+    if (isAvailable) {
+      const vendor = await getUsers().findOne(buildUserIdFilter(existing.vendorId), {
+        projection: {
+          subscriptionPlan: 1,
+          subscriptionStatus: 1,
+          subscriptionExpiresAt: 1,
+        },
+      });
+
+      if (!isPremiumSubscription(vendor, now())) {
+        const usedSlots = await collection.countDocuments(
+          buildSlotFilter(existing.vendorId, idFilter._id),
+        );
+
+        if (usedSlots >= FREE_MENU_ITEM_LIMIT) {
+          throw ApiError.conflict(
+            `Free plan allows ${FREE_MENU_ITEM_LIMIT} active menu items.`,
+            'MENU_ITEM_LIMIT_REACHED',
+          );
+        }
+      }
+    }
+
+    const result = await collection.updateOne(
+      { ...idFilter, status: MENU_STATUS.APPROVED },
+      { $set: { isAvailable, updatedAt: now() } },
+    );
+
+    if ((result?.matchedCount ?? 0) === 0) {
+      throw ApiError.conflict(
+        'Only published menu items can have Admin availability changed.',
+        'MENU_ITEM_NOT_PUBLISHED',
+      );
+    }
+
+    const updated = await collection.findOne(idFilter);
+
+    if (!updated) {
+      throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    return serializeMenu(updated);
+  }
+
   async function remove(id) {
     const filter = buildMenuIdFilter(id);
     const result = await getCollection().deleteOne(filter);
@@ -160,5 +244,5 @@ export function createAdminMenuService(dependencies = {}) {
     return { id: String(id) };
   }
 
-  return Object.freeze({ listAdmin, moderate, remove });
+  return Object.freeze({ listAdmin, moderate, setPublishedAvailability, remove });
 }

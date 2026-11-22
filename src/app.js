@@ -7,6 +7,7 @@ import { createAuth } from './auth/config/better-auth.js';
 import { createErrorHandler } from './middlewares/error.js';
 import { notFound } from './middlewares/not-found.js';
 import { createApiLimiter } from './middlewares/rate-limit.js';
+import { createAdminRoutes } from './modules/admin/admin.routes.js';
 import { createAdminMenuRoutes } from './modules/admin/admin-menu.routes.js';
 import healthRoutes from './modules/health/health.routes.js';
 import { createMenuRoutes } from './modules/menu/menu.routes.js';
@@ -64,6 +65,7 @@ export function createApp(env, dependencies = {}) {
   const auth = createAuth(env);
   app.all('/api/auth/*splat', toNodeHandler(auth));
 
+  const adminDependencies = dependencies.adminDependencies ?? dependencies;
   const paymentDependencies = dependencies.paymentDependencies ?? dependencies;
 
   // Stripe signs the exact bytes it sends. This route must therefore run before
@@ -77,7 +79,8 @@ export function createApp(env, dependencies = {}) {
   app.use('/api/health', healthRoutes);
   app.use('/api/users', createUserRoutes(env));
   app.use('/api/menu', createMenuRoutes(env));
-  app.use('/api/admin/menu', createAdminMenuRoutes(env));
+  app.use('/api/admin/menu', createAdminMenuRoutes(env, adminDependencies));
+  app.use('/api/admin', createAdminRoutes(env, adminDependencies));
   app.use('/api/orders', createCustomerOrderRoutes(env));
   app.use('/api/vendor/orders', createVendorOrderRoutes(env));
   app.use(
