@@ -2,9 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  createImageUploader,
   createImgbbUploader,
   MAX_IMAGE_FILE_SIZE_BYTES,
   MAX_IMAGES_PER_ITEM,
+  MAX_UPLOAD_BODY_SIZE_BYTES,
   validateUploadedFiles,
 } from '../services/imgbb.js';
 
@@ -54,6 +56,39 @@ function jsonResponse(payload, status = 200) {
   });
 }
 
+class FakeMulterError extends Error {
+  constructor(code) {
+    super(code);
+    this.name = 'MulterError';
+    this.code = code;
+  }
+}
+
+function fakeMulterFactory({ error = null, onParse = () => {} } = {}) {
+  function factory() {
+    return {
+      array: () => (req, _res, callback) => {
+        onParse(req);
+        callback(error);
+      },
+    };
+  }
+
+  factory.memoryStorage = () => ({});
+  factory.MulterError = FakeMulterError;
+  return factory;
+}
+
+function runUploadMiddleware(middleware, req = { headers: {} }) {
+  let forwarded = null;
+
+  middleware(req, {}, (error) => {
+    forwarded = error;
+  });
+
+  return { forwarded };
+}
+
 test('validateUploadedFiles rejects missing, wrong-type, oversized and excess files', () => {
   assert.throws(() => validateUploadedFiles([]), { code: 'IMAGE_REQUIRED' });
 
@@ -64,7 +99,11 @@ test('validateUploadedFiles rejects missing, wrong-type, oversized and excess fi
 
   assert.throws(
     () => validateUploadedFiles([makeFile({ size: MAX_IMAGE_FILE_SIZE_BYTES + 1 })]),
-    { code: 'FILE_TOO_LARGE' },
+    (error) => {
+      assert.equal(error.code, 'FILE_TOO_LARGE');
+      assert.equal(error.statusCode, 413);
+      return true;
+    },
   );
 
   assert.throws(
@@ -89,6 +128,37 @@ test('validateUploadedFiles accepts correctly signed images with matching MIME t
 
     assert.equal(files.length, 1);
   }
+});
+
+test('declared oversized multipart requests are rejected before parsing', () => {
+  let parsed = false;
+
+  const middleware = createImageUploader({
+    multer: fakeMulterFactory({
+      onParse: () => {
+        parsed = true;
+      },
+    }),
+  });
+
+  const { forwarded } = runUploadMiddleware(middleware, {
+    headers: { 'content-length': String(MAX_UPLOAD_BODY_SIZE_BYTES + 1) },
+  });
+
+  assert.equal(parsed, false);
+  assert.equal(forwarded.statusCode, 413);
+  assert.equal(forwarded.code, 'PAYLOAD_TOO_LARGE');
+});
+
+test('Multer LIMIT_FILE_SIZE becomes a structured 413 FILE_TOO_LARGE', () => {
+  const middleware = createImageUploader({
+    multer: fakeMulterFactory({ error: new FakeMulterError('LIMIT_FILE_SIZE') }),
+  });
+
+  const { forwarded } = runUploadMiddleware(middleware);
+
+  assert.equal(forwarded.statusCode, 413);
+  assert.equal(forwarded.code, 'FILE_TOO_LARGE');
 });
 
 test('validateUploadedFiles rejects text bytes claiming to be PNG', () => {

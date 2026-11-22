@@ -36,6 +36,12 @@ import { createUserRoutes } from './modules/user/user.routes.js';
 export function createApp(env, dependencies = {}) {
   const app = express();
 
+  // Vercel terminates TLS and forwards each request through one trusted proxy
+  // hop. A hop count (instead of `true`) uses the platform-managed forwarded IP
+  // for rate limiting and secure-cookie detection without trusting arbitrary
+  // forwarded chains.
+  app.set('trust proxy', 1);
+
   // Sets security-related HTTP headers (X-Content-Type-Options, HSTS, etc.).
   app.use(helmet());
 

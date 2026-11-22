@@ -105,7 +105,7 @@ server/
     ├── config/
     │   └── env.js                     # Zod-validated environment variables
     ├── database/
-    │   ├── mongo.js                   # MongoClient lifecycle, getDb(), getMongoClient(), close
+    │   ├── mongo.js                   # cached MongoClient promise, getDb(), getMongoClient(), close
     │   ├── collections.js             # collection names + business accessors
     │   └── indexes.js                 # idempotent index initialization
     ├── middlewares/
@@ -381,6 +381,29 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 
 `PORT` and `NODE_ENV` have defaults. `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL` and `CLIENT_URL` are required. `BETTER_AUTH_SECRET` must be at least 32 characters and must not look like an example placeholder; the error message never includes the value. Empty or example-file placeholder Google values are ignored (Google sign-in is disabled) and a safe warning is printed; a real value for only one of the two is a startup error. The three Stripe values follow the same safe rule: all missing/placeholder values disable Premium subscriptions with a warning, while a partial real configuration is a startup error. `CLIENT_URL` supplies the Checkout success/cancel origins. The three `ADMIN_*` variables stay optional at server startup; the seed script validates them when it runs and never prints them. `IMGBB_API_KEY` is also optional at startup so the server can run without uploads, but a menu image upload returns a safe error until a real key is configured.
 
+## Vercel deployment
+
+Deploy this repository as its own Vercel project. Vercel detects Express with zero configuration from `src/server.js`; the existing `app.listen(env.PORT)` entry point is enough. Do not add a serverless adapter, a legacy `vercel.json`, a custom build step, or a second API implementation. `npm ci` installs dependencies and `npm start` remains the local Node.js command. Select Node.js 22.x in the project settings to match `engines`.
+
+Set these environment variables in Vercel (names only; never commit values):
+
+| Scope | Variables |
+| --- | --- |
+| Required | `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `CLIENT_URL` |
+| Optional auth | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (both or neither) |
+| Optional payments | `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PREMIUM_PRICE_ID` (all three or none) |
+| Optional uploads | `IMGBB_API_KEY` |
+| Manual admin seed only | `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` |
+
+`PORT` is supplied by Vercel and `NODE_ENV` is set to production by the platform; neither needs a repository value. For the planned same-origin frontend rewrite, set both `BETTER_AUTH_URL` and `CLIENT_URL` to the public frontend origin. The Next.js app rewrites `/api/:path*` to the generated backend deployment URL; that URL is only the rewrite upstream, not the public auth origin. This keeps Better Auth callbacks, cookies, JWT issuer/audience and the JWKS URL first-party, so the existing `SameSite=Lax` cookies do not need a cross-site change.
+
+Runtime notes:
+
+- MongoDB reuses one `MongoClient` and one cached connection promise across warm invocations. Index initialization stays at startup, with no per-request connection or disconnect.
+- `trust proxy` uses a single hop so rate limiting reads Vercel's client IP and secure-cookie detection sees the forwarded HTTPS scheme, without trusting arbitrary forwarded chains. The in-memory limiter is per warm instance, not global; global controls belong in Vercel Firewall rather than a new datastore.
+- Upload buffers stay in memory and go straight to ImgBB; nothing is written to the function filesystem. Keep multipart requests below the platform's standard limit, as described in [ImgBB upload flow and limits](#imgbb-upload-flow-and-limits).
+- Stripe, ImgBB and Google remain optional exactly as they are locally. Set the same variables for Preview deployments that should exercise those integrations.
+
 ## Authentication architecture
 
 `src/auth/config/better-auth.js` exports a `createAuth(env)` factory rather than a singleton. `server.js` connects MongoDB first; `createApp(env)` then builds the auth instance so the adapter can receive the already-open `Db` and `MongoClient`. No second client or connection pool is created.
@@ -553,13 +576,14 @@ Safe limits:
 
 | Limit | Value | Reason |
 | --- | --- | --- |
-| Per-file size | 5 MB | Below ImgBB's 32 MB ceiling and safe for memory storage |
+| Per-file size | 3 MB | Below ImgBB's 32 MB ceiling and safe for Vercel's request limit |
+| Total request body | 4 MB | Stays under Vercel's standard 4.5 MB platform limit with room for multipart headers |
 | Files per item | 3 | Keeps one request small and predictable |
 | Text fields | 8 | The create form needs five |
 | Field nesting depth | 1 | Blocks `field[$ne]=...`-style NoSQL injection attempts |
 | MIME types | JPEG, PNG, WebP, GIF | SVG and other types are rejected |
 
-Missing or placeholder credentials produce `500 IMAGE_UPLOAD_UNAVAILABLE`. Multer/ImgBB failures produce safe `400`/`413`/`502` responses with fixed messages. Raw fetch text, response bodies and the API key are never returned.
+Missing or placeholder credentials produce `500 IMAGE_UPLOAD_UNAVAILABLE`. Multer/ImgBB failures produce safe `400`/`413`/`502` responses with fixed messages. Oversized files and declared oversized multipart bodies return structured `413` with `FILE_TOO_LARGE` or `PAYLOAD_TOO_LARGE`; requests above Vercel's platform limit are rejected by Vercel before Express. Raw fetch text, response bodies and the API key are never returned.
 
 ## Admin menu moderation
 

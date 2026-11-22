@@ -13,8 +13,18 @@ import { ApiError } from '../utils/api-error.js';
 /** Official ImgBB v1 upload endpoint (POST with multipart/form-data). */
 export const IMGBB_UPLOAD_URL = 'https://api.imgbb.com/1/upload';
 
-/** 5 MB per file: below ImgBB's 32 MB ceiling and safe for memory storage. */
-export const MAX_IMAGE_FILE_SIZE_BYTES = 5 * 1024 * 1024;
+/**
+ * 3 MB per file: below ImgBB's 32 MB ceiling and below Vercel's 4.5 MB request
+ * body limit when a single maximum-size image is uploaded.
+ */
+export const MAX_IMAGE_FILE_SIZE_BYTES = 3 * 1024 * 1024;
+
+/**
+ * Keep the whole multipart request under Vercel's standard 4.5 MB limit, with
+ * a small margin for boundary and field headers. Requests above the platform
+ * limit are rejected by Vercel before Express runs.
+ */
+export const MAX_UPLOAD_BODY_SIZE_BYTES = 4 * 1024 * 1024;
 
 /** Three images per menu item keeps a single request small and predictable. */
 export const MAX_IMAGES_PER_ITEM = 3;
@@ -135,7 +145,7 @@ export function validateUploadedFiles(files) {
     const size = Number.isFinite(file.size) ? file.size : file.buffer.length;
 
     if (size > MAX_IMAGE_FILE_SIZE_BYTES || file.buffer.length > MAX_IMAGE_FILE_SIZE_BYTES) {
-      throw ApiError.badRequest(
+      throw ApiError.payloadTooLarge(
         `Each image must be ${MAX_IMAGE_FILE_SIZE_BYTES / (1024 * 1024)} MB or smaller.`,
         'FILE_TOO_LARGE',
       );
@@ -194,6 +204,17 @@ export function createImageUploader(dependencies = {}) {
   }).array(EXPECTED_FILE_FIELD, MAX_IMAGES_PER_ITEM);
 
   return function uploadImagesMiddleware(req, res, next) {
+    const declaredLength = Number(req.headers?.['content-length']);
+
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_UPLOAD_BODY_SIZE_BYTES) {
+      return next(
+        ApiError.payloadTooLarge(
+          `Upload request must be ${MAX_UPLOAD_BODY_SIZE_BYTES / (1024 * 1024)} MB or smaller.`,
+          'PAYLOAD_TOO_LARGE',
+        ),
+      );
+    }
+
     return parser(req, res, (error) => {
       if (!error) {
         return next();
@@ -202,7 +223,7 @@ export function createImageUploader(dependencies = {}) {
       if (error instanceof multerLib.MulterError) {
         if (error.code === 'LIMIT_FILE_SIZE') {
           return next(
-            ApiError.badRequest(
+            ApiError.payloadTooLarge(
               `Each image must be ${MAX_IMAGE_FILE_SIZE_BYTES / (1024 * 1024)} MB or smaller.`,
               'FILE_TOO_LARGE',
             ),

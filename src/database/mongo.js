@@ -10,6 +10,7 @@ const SERVER_SELECTION_TIMEOUT_MS = 10_000;
 
 let client = null;
 let database = null;
+let connectionPromise = null;
 
 /**
  * Build a human-readable failure message WITHOUT echoing the driver's raw
@@ -48,28 +49,42 @@ function toSafeDatabaseError(error) {
  * Connect, select the configured database and verify the connection with a
  * ping. Resolves only when MongoDB is actually ready to serve requests.
  */
-export async function connectToDatabase(env) {
-  if (client && database) {
-    return { client, db: database };
+export async function connectToDatabase(env, dependencies = {}) {
+  // One promise per warm instance. Concurrent cold-start callers share the
+  // same MongoClient instead of racing to create separate pools.
+  if (connectionPromise) {
+    return connectionPromise;
   }
 
-  const mongoClient = new MongoClient(env.MONGODB_URI, {
-    serverSelectionTimeoutMS: SERVER_SELECTION_TIMEOUT_MS,
-  });
+  const MongoClientImpl = dependencies.MongoClient ?? MongoClient;
+
+  connectionPromise = (async () => {
+    const mongoClient = new MongoClientImpl(env.MONGODB_URI, {
+      serverSelectionTimeoutMS: SERVER_SELECTION_TIMEOUT_MS,
+    });
+
+    try {
+      await mongoClient.connect();
+
+      const db = mongoClient.db(env.MONGODB_DB_NAME);
+      await db.command({ ping: 1 });
+
+      client = mongoClient;
+      database = db;
+
+      return { client, db };
+    } catch (error) {
+      await mongoClient.close().catch(() => {});
+      throw new Error(toSafeDatabaseError(error));
+    }
+  })();
 
   try {
-    await mongoClient.connect();
-
-    const db = mongoClient.db(env.MONGODB_DB_NAME);
-    await db.command({ ping: 1 });
-
-    client = mongoClient;
-    database = db;
-
-    return { client, db };
+    return await connectionPromise;
   } catch (error) {
-    await mongoClient.close().catch(() => {});
-    throw new Error(toSafeDatabaseError(error));
+    // A failed attempt must be retried on the next call, not cached forever.
+    connectionPromise = null;
+    throw error;
   }
 }
 
@@ -97,13 +112,22 @@ export function getMongoClient() {
 
 /** Close the pool. Safe to call even if the connection never opened. */
 export async function disconnectFromDatabase() {
+  // Wait for an in-flight connect as well, so a shutdown during startup cannot
+  // leave an open pool behind.
+  if (connectionPromise) {
+    await connectionPromise.catch(() => {});
+  }
+
   if (!client) {
+    connectionPromise = null;
     return;
   }
 
   const currentClient = client;
+
   client = null;
   database = null;
+  connectionPromise = null;
 
   try {
     await currentClient.close();
