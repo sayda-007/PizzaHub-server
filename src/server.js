@@ -1,33 +1,5 @@
-import { createApp } from './app.js';
-import { loadEnv } from './config/env.js';
-import { initializeIndexes } from './database/indexes.js';
-import { connectToDatabase, disconnectFromDatabase } from './database/mongo.js';
-
-let env;
-
-try {
-  env = loadEnv();
-} catch (error) {
-  console.error(`[config] ${error.message}`);
-  process.exit(1);
-}
-
-// Do not open the HTTP port until MongoDB is connected and its indexes are
-// ready. This avoids accepting requests during a window where the app could
-// not serve them correctly.
-try {
-  await connectToDatabase(env);
-  console.log('[database] Connected to MongoDB.');
-
-  await initializeIndexes();
-  console.log('[database] Indexes ready.');
-} catch (error) {
-  console.error(`[database] ${error.message}`);
-  await disconnectFromDatabase().catch(() => {});
-  process.exit(1);
-}
-
-const app = createApp(env);
+import app, { env } from './app.js';
+import { disconnectFromDatabase } from './database/mongo.js';
 
 const server = app.listen(env.PORT, () => {
   console.log(`[server] PizzaHub API listening on http://localhost:${env.PORT}`);

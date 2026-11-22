@@ -383,7 +383,7 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 
 ## Vercel deployment
 
-Deploy this repository as its own Vercel project. Vercel detects Express with zero configuration from `src/server.js`; the existing `app.listen(env.PORT)` entry point is enough. Do not add a serverless adapter, a legacy `vercel.json`, a custom build step, or a second API implementation. `npm ci` installs dependencies and `npm start` remains the local Node.js command. Select Node.js 22.x in the project settings to match `engines`.
+Deploy this repository as its own Vercel project. Vercel detects Express with zero configuration from `src/app.js`, which is an ES module and default-exports the configured Express app. `src/server.js` imports that same app and is only the local `app.listen()` startup file. Do not add a serverless adapter, a legacy `vercel.json`, a custom build step, or a second API implementation. `npm ci` installs dependencies and `npm start` remains the local Node.js command. Select Node.js 22.x in the project settings to match `engines`.
 
 Set these environment variables in Vercel (names only; never commit values):
 

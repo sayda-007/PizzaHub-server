@@ -4,6 +4,9 @@ import express from 'express';
 import helmet from 'helmet';
 
 import { createAuth } from './auth/config/better-auth.js';
+import { loadEnv } from './config/env.js';
+import { initializeIndexes } from './database/indexes.js';
+import { connectToDatabase, disconnectFromDatabase } from './database/mongo.js';
 import { createErrorHandler } from './middlewares/error.js';
 import { notFound } from './middlewares/not-found.js';
 import { createApiLimiter } from './middlewares/rate-limit.js';
@@ -23,8 +26,9 @@ import { createUserRoutes } from './modules/user/user.routes.js';
 
 /**
  * Build and return an Express application.
- * The app is a factory rather than a global singleton so tests can create an
- * isolated instance later without starting a real network listener.
+ * The named factory stays available for isolated instances in tests. The
+ * default export at the bottom is the single configured app used by Vercel and
+ * by the local server.js listener.
  *
  * Middleware order matters:
  * security headers -> CORS -> rate limit -> Better Auth handler -> Stripe
@@ -66,8 +70,9 @@ export function createApp(env, dependencies = {}) {
   app.use(createApiLimiter(env));
 
   // Better Auth owns this entire route tree and parses its own bodies. It is
-  // created here because the adapter needs the MongoDB connection opened by
-  // server.js. All /api/auth/* routes bypass express.json().
+  // created after the MongoDB connection is opened during module startup,
+  // because the adapter needs the shared Db and MongoClient. All /api/auth/*
+  // routes bypass express.json().
   const auth = createAuth(env);
   app.all('/api/auth/*splat', toNodeHandler(auth));
 
@@ -99,3 +104,34 @@ export function createApp(env, dependencies = {}) {
 
   return app;
 }
+
+/**
+ * Vercel imports this file directly and expects the default export to be the
+ * configured Express app. Load env, prepare MongoDB, then build that one app
+ * here so Vercel and the local listener share the same routes and middleware.
+ */
+let env;
+
+try {
+  env = loadEnv();
+} catch (error) {
+  console.error(`[config] ${error.message}`);
+  throw error;
+}
+
+try {
+  await connectToDatabase(env);
+  console.log('[database] Connected to MongoDB.');
+
+  await initializeIndexes();
+  console.log('[database] Indexes ready.');
+} catch (error) {
+  console.error(`[database] ${error.message}`);
+  await disconnectFromDatabase().catch(() => {});
+  throw error;
+}
+
+const app = createApp(env);
+
+export { env };
+export default app;
