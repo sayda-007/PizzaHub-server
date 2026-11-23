@@ -10,6 +10,7 @@ import {
   createJwtVerifier,
   JwksUnavailableError,
 } from '../auth/jwt.js';
+import { normalizeBaseUrl } from '../config/env.js';
 import {
   buildUserIdFilter,
   createAuthenticate,
@@ -224,6 +225,34 @@ test('buildJwksUrl uses BETTER_AUTH_URL and tolerates a trailing slash', () => {
     'https://api.example.test/base/api/auth/jwks',
   );
   assert.throws(() => buildJwksUrl(''), /BETTER_AUTH_URL is required/);
+});
+
+test('base URLs are normalized once while paths and query strings are handled safely', () => {
+  assert.equal(normalizeBaseUrl('https://auth.example.test/'), 'https://auth.example.test');
+  assert.equal(
+    normalizeBaseUrl('https://auth.example.test/base///'),
+    'https://auth.example.test/base',
+  );
+  assert.equal(
+    normalizeBaseUrl('https://auth.example.test/base/?x=1#frag'),
+    'https://auth.example.test/base',
+  );
+});
+
+test('a verifier accepts both trailing-slash and canonical issuer spellings', async () => {
+  const tolerantVerifier = createJwtVerifier(
+    { BETTER_AUTH_URL: `${AUTH_URL}/` },
+    { createRemoteJWKSet: () => localJwks },
+  );
+
+  const canonicalToken = await signToken({ issuer: AUTH_URL, audience: AUTH_URL });
+  const trailingToken = await signToken({
+    issuer: `${AUTH_URL}/`,
+    audience: `${AUTH_URL}/`,
+  });
+
+  assert.equal((await tolerantVerifier(canonicalToken)).sub, USER_ID);
+  assert.equal((await tolerantVerifier(trailingToken)).sub, USER_ID);
 });
 
 test('the remote JWKS resolver is created once and reused', async () => {

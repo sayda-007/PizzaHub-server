@@ -301,6 +301,20 @@ test('ImgBB fetch failures and API errors are safe and never include the key', a
   });
 });
 
+test('ImgBB uploader rejects a returned URL from another host', async () => {
+  const uploader = createImgbbUploader(
+    { IMGBB_API_KEY: API_KEY },
+    {
+      fetch: async () =>
+        jsonResponse({ success: true, status: 200, data: { url: 'https://evil.example/pizza.png' } }),
+    },
+  );
+
+  await assert.rejects(() => uploader.uploadImages([makeFile()]), {
+    code: 'IMAGE_UPLOAD_FAILED',
+  });
+});
+
 test('ImgBB uploader rejects a returned URL that is not http or https', async () => {
   const uploader = createImgbbUploader(
     { IMGBB_API_KEY: API_KEY },

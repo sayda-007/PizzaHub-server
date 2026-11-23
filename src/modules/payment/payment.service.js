@@ -176,12 +176,17 @@ function serializeDate(value) {
 
 /** Deliberately excludes Stripe ids and every private user field. */
 export function serializeSubscriptionStatus(user, now = new Date()) {
+  const status = user?.subscriptionStatus ?? SUBSCRIPTION_STATUS.INACTIVE;
+
   return {
     plan: user?.subscriptionPlan ?? SUBSCRIPTION_PLANS.FREE,
-    status: user?.subscriptionStatus ?? SUBSCRIPTION_STATUS.INACTIVE,
+    status,
     expiresAt: serializeDate(user?.subscriptionExpiresAt),
     cancelAtPeriodEnd: user?.subscriptionCancelAtPeriodEnd === true,
     isPremium: isPremiumSubscription(user, now),
+    // Server-owned UI hint: cancellation is possible only when Stripe has a
+    // linked subscription that has not already reached a canceled state.
+    canCancel: Boolean(user?.stripeSubscriptionId) && status !== SUBSCRIPTION_STATUS.CANCELED,
   };
 }
 

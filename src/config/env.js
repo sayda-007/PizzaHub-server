@@ -16,6 +16,24 @@ function isPlaceholderCredential(value) {
   return typeof value !== 'string' || CREDENTIAL_PLACEHOLDER.test(value);
 }
 
+/**
+ * Better Auth, JWT claim checks and CORS all need the same base URL spelling.
+ * Trailing slashes are removed while any intentional path prefix is preserved.
+ */
+export function normalizeBaseUrl(value) {
+  const parsed = new URL(value);
+
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('Base URLs must use http or https.');
+  }
+
+  parsed.hash = '';
+  parsed.search = '';
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+
+  return parsed.href.replace(/\/+$/, '');
+}
+
 const envSchema = z
   .object({
     // --- HTTP server -------------------------------------------------------
@@ -38,8 +56,8 @@ const envSchema = z
       .refine((value) => !isPlaceholderCredential(value), {
         message: 'BETTER_AUTH_SECRET must not be a placeholder value.',
       }),
-    BETTER_AUTH_URL: z.url(),
-    CLIENT_URL: z.url(),
+    BETTER_AUTH_URL: z.url().transform(normalizeBaseUrl),
+    CLIENT_URL: z.url().transform(normalizeBaseUrl),
 
     // --- Google OAuth (optional, but both or neither) -----------------------
     GOOGLE_CLIENT_ID: z.string().trim().min(1).optional(),

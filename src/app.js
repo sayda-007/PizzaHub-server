@@ -23,6 +23,7 @@ import {
   createVendorSubscriptionRoutes,
 } from './modules/payment/payment.routes.js';
 import { createUserRoutes } from './modules/user/user.routes.js';
+import { buildAllowedOrigins } from './utils/origins.js';
 
 /**
  * Build and return an Express application.
@@ -51,7 +52,7 @@ export function createApp(env, dependencies = {}) {
 
   // Only origins listed in the environment are allowed to call the API from a
   // browser. Requests without an Origin header (curl, server-to-server) pass.
-  const allowedOrigins = [env.CLIENT_URL, env.BETTER_AUTH_URL].filter(Boolean);
+  const allowedOrigins = buildAllowedOrigins(env);
 
   app.use(
     cors({

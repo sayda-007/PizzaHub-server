@@ -767,6 +767,10 @@ test('cancel endpoint uses stored subscription ids and is idempotent', async () 
 });
 
 test('cancel rejects a vendor with no linked subscription', async () => {
+  const statusResponse = await apiRequest('/');
+  assert.equal(statusResponse.status, 200);
+  assert.equal((await statusResponse.json()).subscription.canCancel, false);
+
   await expectError(
     await apiRequest('/cancel', { method: 'POST', body: {} }),
     404,
@@ -783,12 +787,14 @@ test('status endpoint returns only safe subscription fields', async () => {
   const body = await response.json();
   assert.deepEqual(Object.keys(body), ['subscription']);
   assert.deepEqual(Object.keys(body.subscription).sort(), [
+    'canCancel',
     'cancelAtPeriodEnd',
     'expiresAt',
     'isPremium',
     'plan',
     'status',
   ]);
+  assert.equal(body.subscription.canCancel, true);
   assert.equal(body.subscription.isPremium, true);
   assert.doesNotMatch(JSON.stringify(body), new RegExp(SUBSCRIPTION_ID));
   assert.doesNotMatch(JSON.stringify(body), new RegExp(CUSTOMER_ID_FOR_STRIPE));

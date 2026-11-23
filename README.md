@@ -750,7 +750,7 @@ All three Stripe variables must be real together, or all must be missing/placeho
 4. Creates a `subscription` Checkout Session using only `STRIPE_PREMIUM_PRICE_ID`, with the vendor id in `client_reference_id`, session metadata and `subscription_data.metadata`. A daily stable idempotency key protects against duplicate submissions.
 5. Returns only `{ checkoutUrl, sessionId }`.
 
-`GET /api/vendor/subscription` returns `{ subscription }` with `plan`, `status`, `expiresAt`, `cancelAtPeriodEnd` and a computed `isPremium`. Stripe ids and private user fields are excluded. Premium access still requires **all three** MongoDB conditions: `subscriptionPlan: 'premium'`, `subscriptionStatus: 'active'` and a future `subscriptionExpiresAt`. JWT subscription claims are ignored.
+`GET /api/vendor/subscription` returns `{ subscription }` with `plan`, `status`, `expiresAt`, `cancelAtPeriodEnd`, a computed `isPremium`, and a server-owned `canCancel` flag that is true only when a linked, non-canceled Stripe subscription exists. Stripe ids and private user fields are excluded. Premium access still requires **all three** MongoDB conditions: `subscriptionPlan: 'premium'`, `subscriptionStatus: 'active'` and a future `subscriptionExpiresAt`. JWT subscription claims are ignored.
 
 ### Webhooks, idempotency and cancellation
 

@@ -93,18 +93,29 @@ function safeFileName(value) {
   return base.slice(0, 120) || 'menu-image';
 }
 
-function safeProtocolUrl(value) {
+const IMGBB_CDN_HOSTS = Object.freeze(['i.ibb.co']);
+
+/** Only URLs returned by the ImgBB CDN may become trusted menu images. */
+export function isTrustedMenuImageUrl(value) {
   if (typeof value !== 'string' || value.length > 2048) {
-    return null;
+    return false;
   }
 
   try {
     const parsed = new URL(value);
+    const host = parsed.hostname.toLowerCase();
 
-    return ['http:', 'https:'].includes(parsed.protocol) ? value : null;
+    return (
+      parsed.protocol === 'https:' &&
+      IMGBB_CDN_HOSTS.some((allowed) => host === allowed || host.endsWith(`.${allowed}`))
+    );
   } catch {
-    return null;
+    return false;
   }
+}
+
+function safeProtocolUrl(value) {
+  return isTrustedMenuImageUrl(value) ? value : null;
 }
 
 /**

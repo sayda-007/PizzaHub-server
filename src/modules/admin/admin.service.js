@@ -146,7 +146,12 @@ export function buildAdminTransactionFilter(options) {
   const filter = {};
 
   if (options.status) {
-    filter.status = options.status;
+    // The serializer treats paymentStatus as authoritative and falls back to
+    // status. Filtering must follow the same rule so legacy records match.
+    filter.$or = [
+      { paymentStatus: options.status },
+      { paymentStatus: { $exists: false }, status: options.status },
+    ];
   }
 
   if (options.vendorId) {

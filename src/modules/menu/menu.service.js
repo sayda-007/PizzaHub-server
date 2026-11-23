@@ -5,6 +5,7 @@ import {
   SUBSCRIPTION_STATUS,
 } from '../../auth/config/better-auth.js';
 import { getMenuItemsCollection } from '../../database/collections.js';
+import { isTrustedMenuImageUrl } from '../../services/imgbb.js';
 import { ApiError } from '../../utils/api-error.js';
 import {
   MENU_STATUS,
@@ -150,14 +151,8 @@ function validateStoredImageUrls(imageUrls) {
       throw ApiError.badRequest('Uploaded images must be valid URLs.', 'INVALID_IMAGE_URL');
     }
 
-    try {
-      const parsed = new URL(url);
-
-      if (!['http:', 'https:'].includes(parsed.protocol)) {
-        throw new Error('unsupported protocol');
-      }
-    } catch {
-      throw ApiError.badRequest('Uploaded images must be valid URLs.', 'INVALID_IMAGE_URL');
+    if (!isTrustedMenuImageUrl(url)) {
+      throw ApiError.badRequest('Uploaded images must be valid ImgBB URLs.', 'INVALID_IMAGE_URL');
     }
   }
 
@@ -330,6 +325,8 @@ export function createMenuService(dependencies = {}) {
       pagination: {
         page,
         limit,
+        totalItems: total,
+        // Deprecated alias kept for existing clients while they migrate.
         total,
         totalPages: total === 0 ? 0 : Math.ceil(total / limit),
       },

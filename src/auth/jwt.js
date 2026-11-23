@@ -74,11 +74,14 @@ export function createJwtVerifier(env, dependencies = {}) {
   const verify = dependencies.jwtVerify ?? jwtVerify;
 
   // Better Auth signs tokens with `options.baseURL` as both issuer and audience.
-  // Use the configured value rather than inventing separate settings.
+  // loadEnv() normalizes that value; accepting both spellings also keeps tokens
+  // issued just before a trailing-slash config change valid until refresh.
+  const canonicalBaseUrl = baseUrl.trim().replace(/\/+$/, '');
+  const acceptedBaseUrls = [...new Set([baseUrl.trim(), canonicalBaseUrl])];
   const expectedClaims = Object.freeze({
     algorithms: [...BETTER_AUTH_JWT_ALGORITHMS],
-    issuer: baseUrl,
-    audience: baseUrl,
+    issuer: acceptedBaseUrls.length === 1 ? canonicalBaseUrl : acceptedBaseUrls,
+    audience: acceptedBaseUrls.length === 1 ? canonicalBaseUrl : acceptedBaseUrls,
   });
 
   const keyResolver = makeRemoteJWKSet(jwksUrl);

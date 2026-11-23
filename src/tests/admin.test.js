@@ -1141,6 +1141,43 @@ test('admin transaction status, vendor and date filters use the existing schema'
   assert.equal(failedBody.transactions[0].paymentStatus, 'failed');
   assert.equal(failedBody.transactions[0].stripeInvoiceId, 'in_local_only_002');
 
+  // Legacy rows may store only paymentStatus, or a stale status alongside it.
+  // The filter must agree with serializeAdminTransaction() in both cases.
+  fakeTransactions.state.items.push(
+    {
+      _id: new ObjectId('65d000000000000000000004'),
+      vendorId: VENDOR_ID,
+      paymentStatus: 'failed',
+      amount: 900,
+      currency: 'usd',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: FIXED_NOW,
+    },
+    {
+      _id: new ObjectId('65d000000000000000000005'),
+      vendorId: VENDOR_ID,
+      paymentStatus: 'paid',
+      status: 'failed',
+      amount: 900,
+      currency: 'usd',
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+      updatedAt: FIXED_NOW,
+    },
+  );
+
+  const legacyFailed = await apiRequest(`/api/admin/transactions?status=failed&vendorId=${VENDOR_ID}`);
+  assert.equal((await legacyFailed.json()).pagination.totalItems, 2);
+
+  const authoritativePaymentStatus = await apiRequest(
+    `/api/admin/transactions?status=paid&vendorId=${VENDOR_ID}`,
+  );
+  const authoritativeBody = await authoritativePaymentStatus.json();
+  assert.equal(authoritativeBody.pagination.totalItems, 2);
+  assert.deepEqual(
+    authoritativeBody.transactions.map((item) => item.paymentStatus),
+    ['paid', 'paid'],
+  );
+
   const dateRange = await apiRequest(
     '/api/admin/transactions?fromDate=2026-01-02&toDate=2026-01-03',
   );
