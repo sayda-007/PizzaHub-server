@@ -37,6 +37,16 @@ const USER_LOOKUP_PROJECTION = Object.freeze({
 const BEARER_PATTERN = /^Bearer\s+(\S+)$/i;
 const OBJECT_ID_PATTERN = /^[0-9a-f]{24}$/i;
 
+/** The JWT plugin adds this claim to every token issued by /api/auth/token. */
+export const SESSION_ID_CLAIM = 'sid';
+
+const SESSION_LOOKUP_PROJECTION = Object.freeze({
+  _id: 1,
+  id: 1,
+  userId: 1,
+  expiresAt: 1,
+});
+
 /**
  * Better Auth's MongoDB adapter maps `id` to `_id` and stores it as an
  * ObjectId when no custom id generator is configured. It can return a string
@@ -73,6 +83,43 @@ export async function findUserById(userId, collection) {
   return users.findOne(filter, { projection: USER_LOOKUP_PROJECTION });
 }
 
+/**
+ * Better Auth stores session ids under `_id` in MongoDB. The same ObjectId or
+ * legacy-string handling as user ids applies here.
+ */
+export function findSessionById(sessionId, collection) {
+  const filter = buildUserIdFilter(sessionId);
+
+  if (!filter) {
+    return null;
+  }
+
+  const sessions = collection ?? getDb().collection(COLLECTIONS.SESSIONS);
+
+  return sessions.findOne(filter, { projection: SESSION_LOOKUP_PROJECTION });
+}
+
+/** A token is usable only while its Better Auth session exists and is live. */
+export function isActiveSession(session, userId, now = new Date()) {
+  if (!session || typeof session !== 'object') {
+    return false;
+  }
+
+  const sessionUserId = session.userId?._id ?? session.userId?.id ?? session.userId;
+
+  if (sessionUserId === undefined || sessionUserId === null) {
+    return false;
+  }
+
+  if (String(sessionUserId) !== String(userId)) {
+    return false;
+  }
+
+  const expiresAt = new Date(session.expiresAt).getTime();
+
+  return Number.isFinite(expiresAt) && expiresAt > now.getTime();
+}
+
 /** Build the small object that feature middleware and routes may read. */
 export function sanitizeUser(document, fallbackId) {
   const safeUser = {};
@@ -102,6 +149,8 @@ export function sanitizeUser(document, fallbackId) {
 export function createAuthenticate(env, dependencies = {}) {
   const verifyToken = dependencies.verifyToken ?? createJwtVerifier(env);
   const findUser = dependencies.findUser ?? findUserById;
+  const findSession = dependencies.findSession ?? findSessionById;
+  const now = dependencies.now ?? (() => new Date());
 
   return async function authenticate(req, _res, next) {
     try {
@@ -136,6 +185,20 @@ export function createAuthenticate(env, dependencies = {}) {
       const subject = claims?.sub;
 
       if (typeof subject !== 'string' || subject.trim() === '') {
+        throw ApiError.unauthorized('Invalid or expired token.');
+      }
+
+      // A signed JWT alone is not enough: /sign-out deletes this session, and
+      // an admin may revoke it. Checking the record closes the logout window.
+      const sessionId = claims[SESSION_ID_CLAIM];
+
+      if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+        throw ApiError.unauthorized('Invalid or expired token.');
+      }
+
+      const session = await findSession(sessionId);
+
+      if (!isActiveSession(session, subject, now())) {
         throw ApiError.unauthorized('Invalid or expired token.');
       }
 

@@ -5,6 +5,9 @@ import helmet from 'helmet';
 
 import { createAuth } from './auth/config/better-auth.js';
 import { loadEnv } from './config/env.js';
+import {
+  getMenuSlotReservationsCollection,
+} from './database/collections.js';
 import { initializeIndexes } from './database/indexes.js';
 import { connectToDatabase, disconnectFromDatabase } from './database/mongo.js';
 import { createErrorHandler } from './middlewares/error.js';
@@ -77,8 +80,16 @@ export function createApp(env, dependencies = {}) {
   const auth = createAuth(env);
   app.all('/api/auth/*splat', toNodeHandler(auth));
 
-  const adminDependencies = dependencies.adminDependencies ?? dependencies;
-  const paymentDependencies = dependencies.paymentDependencies ?? dependencies;
+  // One injected service dependency set is shared by every feature router. It
+  // enables the atomic menu-slot path in production while still allowing tests
+  // to inject isolated collections and services.
+  const serviceDependencies = dependencies.serviceDependencies ?? {
+    ...dependencies,
+    slotsCollection: dependencies.slotsCollection ?? getMenuSlotReservationsCollection,
+  };
+  const sharedDependencies = { ...dependencies, serviceDependencies };
+  const adminDependencies = dependencies.adminDependencies ?? sharedDependencies;
+  const paymentDependencies = dependencies.paymentDependencies ?? sharedDependencies;
 
   // Stripe signs the exact bytes it sends. This route must therefore run before
   // express.json(); reconstructing a body from parsed JSON can break signatures.
@@ -89,12 +100,12 @@ export function createApp(env, dependencies = {}) {
   // Feature routers are mounted under /api. More modules arrive in later
   // milestones through src/routes/index.js.
   app.use('/api/health', healthRoutes);
-  app.use('/api/users', createUserRoutes(env));
-  app.use('/api/menu', createMenuRoutes(env));
+  app.use('/api/users', createUserRoutes(env, sharedDependencies));
+  app.use('/api/menu', createMenuRoutes(env, sharedDependencies));
   app.use('/api/admin/menu', createAdminMenuRoutes(env, adminDependencies));
   app.use('/api/admin', createAdminRoutes(env, adminDependencies));
-  app.use('/api/orders', createCustomerOrderRoutes(env));
-  app.use('/api/vendor/orders', createVendorOrderRoutes(env));
+  app.use('/api/orders', createCustomerOrderRoutes(env, sharedDependencies));
+  app.use('/api/vendor/orders', createVendorOrderRoutes(env, sharedDependencies));
   app.use(
     '/api/vendor/subscription',
     createVendorSubscriptionRoutes(env, paymentDependencies),

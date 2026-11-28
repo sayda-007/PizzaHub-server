@@ -7,6 +7,7 @@ import {
 import { getMenuItemsCollection } from '../../database/collections.js';
 import { isTrustedMenuImageUrl } from '../../services/imgbb.js';
 import { ApiError } from '../../utils/api-error.js';
+import { createMenuSlotService, MENU_SLOT_LIMIT } from './menu-slots.js';
 import {
   MENU_STATUS,
   escapeRegex,
@@ -17,12 +18,12 @@ import {
 
 const OBJECT_ID_PATTERN = /^[0-9a-f]{24}$/i;
 
-/** Free vendors may reserve three slots; pending items count toward the limit. */
-export const FREE_MENU_ITEM_LIMIT = 3;
+/** Backwards-compatible name for the single shared free-plan slot limit. */
+export const FREE_MENU_ITEM_LIMIT = MENU_SLOT_LIMIT;
 
 const SLOT_MENU_STATUSES = Object.freeze([MENU_STATUS.PENDING, MENU_STATUS.APPROVED]);
 const LIMIT_MESSAGE =
-  `Free plan allows ${FREE_MENU_ITEM_LIMIT} active menu items. ` +
+  `Free plan allows ${MENU_SLOT_LIMIT} active menu items. ` +
   'Upgrade to Premium or make an item unavailable to add another.';
 
 /** Public browse never reads vendor-owned or moderation fields into the API. */
@@ -243,6 +244,13 @@ export function buildMenuUpdateSet(validatedUpdate) {
 export function createMenuService(dependencies = {}) {
   const collectionSource = dependencies.collection;
   const now = dependencies.now ?? (() => new Date());
+  // An injected slot service (or slot collection) enables the atomic path.
+  // Focused tests that only inject a menu collection keep the legacy count path.
+  const slotService =
+    dependencies.slotService ??
+    (dependencies.slotsCollection
+      ? createMenuSlotService({ collection: dependencies.slotsCollection })
+      : null);
 
   function getCollection() {
     if (typeof collectionSource === 'function') {
@@ -254,6 +262,78 @@ export function createMenuService(dependencies = {}) {
 
   async function countSlots(vendorId, excludeId) {
     return getCollection().countDocuments(buildSlotFilter(vendorId, excludeId));
+  }
+
+  async function currentSlotItemIds(vendorId) {
+    const documents = await getCollection()
+      .find(buildSlotFilter(vendorId))
+      .project({ _id: 1 })
+      .toArray();
+
+    return documents.map((document) => document._id?.toString?.() ?? document.id);
+  }
+
+  /** Make the reservation document match the items that really consume slots. */
+  async function reconcileSlots(vendorId, options) {
+    if (!slotService?.reconcile) {
+      return;
+    }
+
+    await slotService.reconcile(vendorId, await currentSlotItemIds(vendorId), options);
+  }
+
+  /** Clear an in-flight marker only after the menu document consumes a slot. */
+  async function confirmSlot(vendorId, itemId) {
+    if (!slotService?.confirm) {
+      return;
+    }
+
+    try {
+      await slotService.confirm(vendorId, itemId);
+    } catch {
+      // A later reconciliation can still drop markers that match actual items.
+    }
+  }
+
+  /**
+   * A release failure must not leave a stale reservation behind. Reconciliation
+   * is authoritative, so the operation can succeed even when the incremental
+   * $pull failed.
+   */
+  async function releaseSlot(vendorId, itemId) {
+    if (!slotService) {
+      return;
+    }
+
+    try {
+      await slotService.release(vendorId, itemId);
+    } catch {
+      // Healed by the authoritative reconciliation below.
+    }
+
+    await reconcileSlots(vendorId, { forceRemoveItemIds: [itemId] });
+  }
+
+  async function reserveSlot(vendorId, itemId, user, options = {}) {
+    if (!slotService) {
+      return false;
+    }
+
+    await reconcileSlots(vendorId);
+
+    if (await slotService.has(vendorId, itemId)) {
+      return false;
+    }
+
+    await slotService.reserve({
+      vendorId,
+      itemId,
+      unlimited: isPremiumSubscription(user, now()),
+      existingItemIds: await currentSlotItemIds(vendorId),
+      pending: options.pending === true,
+    });
+
+    return true;
   }
 
   /** Premium users skip the count entirely; everyone else gets a fixed 409. */
@@ -277,15 +357,22 @@ export function createMenuService(dependencies = {}) {
     const safeVendorId = requireVendorId(vendorId);
     const images = validateStoredImageUrls(imageUrls);
     const timestamp = now();
+    const itemId = new ObjectId();
 
-    // Check again at the database boundary. The controller also checks before
-    // ImgBB upload so a rejected create never spends an external upload call.
-    await assertSlotAvailable(safeVendorId, user, timestamp);
+    // Reserve before inserting. MongoDB applies the limit atomically, so two
+    // concurrent creates cannot both observe the same free slot. The controller
+    // still checks before ImgBB upload to avoid a rejected external upload.
+    const reserved = await reserveSlot(safeVendorId, itemId.toString(), user, { pending: true });
+
+    if (!slotService) {
+      await assertSlotAvailable(safeVendorId, user, timestamp);
+    }
 
     // status, isAvailable, vendorId and createdAt are server-owned. A caller
     // cannot supply them because validatedData contains only the five fields
     // from the strict create schema.
     const document = {
+      _id: itemId,
       vendorId: safeVendorId,
       itemName: validatedData.itemName,
       category: validatedData.category,
@@ -299,9 +386,27 @@ export function createMenuService(dependencies = {}) {
       updatedAt: timestamp,
     };
 
-    const result = await getCollection().insertOne(document);
+    try {
+      const result = await getCollection().insertOne(document);
 
-    return serializeMenu({ ...document, _id: result?.insertedId ?? document._id });
+      // The menu document now exists, so the in-flight marker is no longer
+      // needed. Failure here is harmless: the item itself is already stored.
+      if (reserved && slotService.confirm) {
+        try {
+          await slotService.confirm(safeVendorId, itemId.toString());
+        } catch {
+          // Reconciliation and later releases can still clean the marker.
+        }
+      }
+
+      return serializeMenu({ ...document, _id: result?.insertedId ?? document._id });
+    } catch (error) {
+      if (reserved) {
+        await releaseSlot(safeVendorId, itemId.toString());
+      }
+
+      throw error;
+    }
   }
 
   async function listMine(vendorId, query) {
@@ -395,11 +500,19 @@ export function createMenuService(dependencies = {}) {
     const current = existing.isAvailable !== false;
     const next = !current;
     const timestamp = now();
+    const itemId = existing._id?.toString?.() ?? id;
+    let reserved = false;
 
     // Only a new active/reserved item needs a slot. Rejected or inactive items
-    // remain non-consuming even after an availability toggle.
+    // remain non-consuming even after an availability toggle. The reservation is
+    // pending until the document is updated so a concurrent reconciliation
+    // cannot mistake it for a stale id while the item is still inactive.
     if (next && menuItemConsumesSlot({ ...existing, isAvailable: next })) {
-      await assertSlotAvailable(vendorId, user, timestamp, filter._id);
+      reserved = await reserveSlot(vendorId, itemId, user, { pending: true });
+
+      if (!slotService) {
+        await assertSlotAvailable(vendorId, user, timestamp, filter._id);
+      }
     }
 
     const result = await getCollection().updateOne(filter, {
@@ -407,13 +520,30 @@ export function createMenuService(dependencies = {}) {
     });
 
     if ((result?.matchedCount ?? 0) === 0) {
+      if (reserved) {
+        await releaseSlot(vendorId, itemId);
+      }
+
       throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    // Hiding an item frees its slot immediately; restoring one reserves it.
+    if (slotService && !next) {
+      await releaseSlot(vendorId, itemId);
     }
 
     const updated = await getCollection().findOne(filter);
 
     if (!updated) {
+      if (reserved && next) {
+        await releaseSlot(vendorId, itemId);
+      }
+
       throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    if (reserved && next) {
+      await confirmSlot(vendorId, itemId);
     }
 
     return serializeMenu(updated);
@@ -425,6 +555,12 @@ export function createMenuService(dependencies = {}) {
 
     if ((result?.deletedCount ?? 0) === 0) {
       throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    const itemId = id?.toString?.() ?? id;
+
+    if (slotService) {
+      await releaseSlot(vendorId, itemId);
     }
 
     return { id: String(id) };

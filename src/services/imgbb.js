@@ -1,3 +1,5 @@
+import { Transform } from 'node:stream';
+
 import multer from 'multer';
 
 import { ApiError } from '../utils/api-error.js';
@@ -25,6 +27,9 @@ export const MAX_IMAGE_FILE_SIZE_BYTES = 3 * 1024 * 1024;
  * limit are rejected by Vercel before Express runs.
  */
 export const MAX_UPLOAD_BODY_SIZE_BYTES = 4 * 1024 * 1024;
+
+/** Bound a slow or stalled ImgBB request without exposing fetch error details. */
+export const IMGBB_UPLOAD_TIMEOUT_MS = 10_000;
 
 /** Three images per menu item keeps a single request small and predictable. */
 export const MAX_IMAGES_PER_ITEM = 3;
@@ -182,12 +187,47 @@ export function validateUploadedFiles(files) {
   return files;
 }
 
+function bodyTooLargeError() {
+  return ApiError.payloadTooLarge(
+    `Upload request must be ${MAX_UPLOAD_BODY_SIZE_BYTES / (1024 * 1024)} MB or smaller.`,
+    'PAYLOAD_TOO_LARGE',
+  );
+}
+
+/**
+ * Count the real bytes delivered by a chunked request. `Content-Length` can be
+ * absent or understated, so relying on the declared value alone is not enough.
+ */
+export function createBodySizeGuard(dependencies = {}) {
+  const limit = dependencies.limit ?? MAX_UPLOAD_BODY_SIZE_BYTES;
+
+  return function streamHandler(req, busboy) {
+    let received = 0;
+    const counter = new Transform({
+      transform(chunk, _encoding, callback) {
+        received += chunk.length;
+
+        if (received > limit) {
+          callback(bodyTooLargeError());
+          return;
+        }
+
+        callback(null, chunk);
+      },
+    });
+
+    counter.on('error', (error) => busboy.destroy(error));
+    req.pipe(counter).pipe(busboy);
+  };
+}
+
 /** Multer accepts only image files and stops oversized/count abuse early. */
 export function createImageUploader(dependencies = {}) {
   const multerLib = dependencies.multer ?? multer;
 
   const parser = multerLib({
     storage: multerLib.memoryStorage(),
+    streamHandler: dependencies.streamHandler ?? createBodySizeGuard(),
     limits: {
       fileSize: MAX_IMAGE_FILE_SIZE_BYTES,
       files: MAX_IMAGES_PER_ITEM,
@@ -270,6 +310,8 @@ export function createImageUploader(dependencies = {}) {
 export function createImgbbUploader(env, dependencies = {}) {
   const fetchImpl = dependencies.fetch ?? fetch;
   const uploadUrl = dependencies.uploadUrl ?? IMGBB_UPLOAD_URL;
+  const timeoutMs = dependencies.timeoutMs ?? IMGBB_UPLOAD_TIMEOUT_MS;
+  const AbortControllerImpl = dependencies.AbortController ?? globalThis.AbortController;
 
   async function uploadOne(file) {
     const apiKey = env?.IMGBB_API_KEY;
@@ -291,23 +333,29 @@ export function createImgbbUploader(env, dependencies = {}) {
     );
 
     let response;
-
-    try {
-      response = await fetchImpl(uploadUrl, { method: 'POST', body: form });
-    } catch {
-      throw new ApiError(502, 'Image upload failed. Please try again.', 'IMAGE_UPLOAD_FAILED');
-    }
-
-    if (!response?.ok) {
-      throw new ApiError(502, 'Image upload failed. Please try again.', 'IMAGE_UPLOAD_FAILED');
-    }
-
     let payload;
+    const controller = new AbortControllerImpl();
+
+    // Keep the deadline active through the body read as well. Headers can
+    // arrive quickly while a malicious or broken server stalls the JSON stream.
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
+      response = await fetchImpl(uploadUrl, {
+        method: 'POST',
+        body: form,
+        signal: controller.signal,
+      });
+
+      if (!response?.ok) {
+        throw new ApiError(502, 'Image upload failed. Please try again.', 'IMAGE_UPLOAD_FAILED');
+      }
+
       payload = await response.json();
     } catch {
       throw new ApiError(502, 'Image upload failed. Please try again.', 'IMAGE_UPLOAD_FAILED');
+    } finally {
+      clearTimeout(timer);
     }
 
     const imageUrl = safeProtocolUrl(payload?.data?.url ?? payload?.data?.display_url);

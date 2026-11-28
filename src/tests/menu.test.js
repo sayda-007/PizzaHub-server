@@ -5,8 +5,11 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 
 import { createAuthenticate } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
+import { createFakeMenuSlots } from './menu-slot-fake.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { createMenuRoutes } from '../modules/menu/menu.routes.js';
+import { createMenuSlotService } from '../modules/menu/menu-slots.js';
 import {
   FREE_MENU_ITEM_LIMIT,
   createMenuService,
@@ -336,6 +339,7 @@ function seedPublicItem(overrides = {}) {
 }
 
 let fakeCollection;
+let fakeSlots;
 let uploadCalls = [];
 let failUpload = false;
 let server;
@@ -421,6 +425,7 @@ before(async () => {
   console.error = () => {};
 
   fakeCollection = createFakeCollection();
+  fakeSlots = createFakeMenuSlots();
   const authenticate = createAuthenticate(
     { BETTER_AUTH_URL: AUTH_URL },
     {
@@ -435,6 +440,7 @@ before(async () => {
         // these and use the fake MongoDB user map above instead.
         return {
           sub: subject,
+          sid: subject,
           role: 'vendor',
           subscriptionPlan: 'premium',
           subscriptionStatus: 'active',
@@ -442,6 +448,7 @@ before(async () => {
         };
       },
       findUser: async (userId) => users.get(userId) ?? null,
+      findSession: findActiveTestSession,
     },
   );
 
@@ -457,8 +464,11 @@ before(async () => {
     },
   };
 
+  // Match app.js: route tests must exercise the atomic slots collection, not
+  // the legacy count fallback used when no slotsCollection is injected.
   const menuService = createMenuService({
     collection: () => fakeCollection,
+    slotsCollection: () => fakeSlots,
     now: () => FIXED_DATE,
   });
 
@@ -478,6 +488,10 @@ beforeEach(() => {
   fakeCollection.state.calls = fresh.state.calls;
   fakeCollection.state.nextId = fresh.state.nextId;
   fakeCollection.state.failUpdate = false;
+
+  const freshSlots = createFakeMenuSlots();
+  fakeSlots.state.documents = freshSlots.state.documents;
+  fakeSlots.state.calls = freshSlots.state.calls;
 
   uploadCalls = [];
   failUpload = false;
@@ -809,6 +823,11 @@ test('a vendor can create an item with pending status and server-owned fields', 
   assert.equal(insert.document.status, 'pending');
   assert.equal(insert.document.isAvailable, true);
   assert.equal(uploadCalls.length, 1);
+
+  // The route uses the production atomic slot path, not the count fallback.
+  // The fake collection assigns its own stored id, so compare with the insert.
+  const reservation = fakeSlots.state.documents.find((doc) => doc._id === VENDOR_ID);
+  assert.deepEqual(reservation?.itemIds, [String(insert.document._id)]);
 });
 
 test('a free vendor can create up to three active/reserved items', async () => {
@@ -1200,8 +1219,14 @@ test('reactivating an item is blocked when the free limit is already reached', a
     false,
   );
 
-  const countCall = fakeCollection.state.calls.find((call) => call.method === 'countDocuments');
-  assert.equal(String(countCall.filter._id.$ne), String(targetId));
+  // The production atomic path rejects the fourth reservation without using
+  // the legacy count fallback.
+  const reservation = fakeSlots.state.documents.find((doc) => doc._id === VENDOR_ID);
+  assert.equal(reservation?.itemIds.length, FREE_MENU_ITEM_LIMIT);
+  assert.equal(reservation?.itemIds.includes(String(targetId)), false);
+  assert.ok(
+    fakeSlots.state.calls.some((call) => call.method === 'findOneAndUpdate'),
+  );
 });
 
 test('general PATCH cannot change availability or bypass the slot limit', async () => {
@@ -1307,4 +1332,148 @@ test('database failures reach the centralized generic 500 handler', async () => 
 test('createMenuRoutes builds its services without injected dependencies', () => {
   const router = createMenuRoutes({ BETTER_AUTH_URL: AUTH_URL });
   assert.equal(typeof router, 'function');
+});
+
+test('concurrent vendor creates reserve only three free-plan slots', async () => {
+  const menu = createFakeCollection();
+  const slots = createFakeMenuSlots();
+  const service = createMenuService({
+    collection: () => menu,
+    slotsCollection: () => slots,
+    now: () => FIXED_DATE,
+  });
+
+  const results = await Promise.allSettled(
+    Array.from({ length: FREE_MENU_ITEM_LIMIT + 1 }, (_, index) =>
+      service.create(
+        VENDOR_ID,
+        validFields({ itemName: `Concurrent Pizza ${index + 1}` }),
+        [IMAGE_URL],
+        users.get(VENDOR_ID),
+      ),
+    ),
+  );
+
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, FREE_MENU_ITEM_LIMIT);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.equal(
+    results.find((result) => result.status === 'rejected').reason.code,
+    'MENU_ITEM_LIMIT_REACHED',
+  );
+  assert.equal(menu.state.items.length, FREE_MENU_ITEM_LIMIT);
+  assert.equal(slots.state.documents[0].itemIds.length, FREE_MENU_ITEM_LIMIT);
+});
+
+test('concurrent vendor availability restores reserve only three free-plan slots', async () => {
+  const menu = createFakeCollection();
+  const slots = createFakeMenuSlots();
+  const service = createMenuService({
+    collection: () => menu,
+    slotsCollection: () => slots,
+    now: () => FIXED_DATE,
+  });
+
+  const items = Array.from({ length: FREE_MENU_ITEM_LIMIT + 1 }, (_, index) =>
+    menu.seedItem({
+      _id: new ObjectId(`65c0000000000000000000${String(index + 10).padStart(2, '0')}`),
+      itemName: `Hidden Pizza ${index + 1}`,
+      status: MENU_STATUS.APPROVED,
+      isAvailable: false,
+    }),
+  );
+
+  const results = await Promise.allSettled(
+    items.map((item) =>
+      service.toggleAvailability(VENDOR_ID, item._id.toString(), users.get(VENDOR_ID)),
+    ),
+  );
+
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, FREE_MENU_ITEM_LIMIT);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.equal(
+    results.find((result) => result.status === 'rejected').reason.code,
+    'MENU_ITEM_LIMIT_REACHED',
+  );
+  assert.equal(menu.state.items.filter((item) => item.isAvailable).length, FREE_MENU_ITEM_LIMIT);
+});
+
+test('a reconciliation racing a vendor availability restore keeps the reserved slot', async () => {
+  const menu = createFakeCollection();
+  const item = menu.seedItem({
+    _id: new ObjectId('65c000000000000000000019'),
+    itemName: 'Race Restore Pizza',
+    status: MENU_STATUS.APPROVED,
+    isAvailable: false,
+  });
+  const itemId = item._id.toString();
+  const slots = createFakeMenuSlots();
+  const slotService = createMenuSlotService({ collection: slots });
+  let reserveObserved = false;
+  const observingSlots = {
+    ...slots,
+    async findOneAndUpdate(filter, update, options) {
+      const result = await slots.findOneAndUpdate(filter, update, options);
+
+      if (result) {
+        reserveObserved = true;
+      }
+
+      return result;
+    },
+  };
+  const interleavedMenu = {
+    ...menu,
+    async updateOne(filter, update, options) {
+      if (reserveObserved && Object.hasOwn(update?.$set ?? {}, 'isAvailable')) {
+        // Runs after the slot is reserved but before the document is active.
+        await slotService.reconcile(VENDOR_ID, []);
+      }
+
+      return menu.updateOne(filter, update, options);
+    },
+  };
+  const service = createMenuService({
+    collection: () => interleavedMenu,
+    slotsCollection: () => observingSlots,
+    now: () => FIXED_DATE,
+  });
+
+  await service.toggleAvailability(VENDOR_ID, itemId, users.get(VENDOR_ID));
+
+  assert.equal(menu.state.items[0].isAvailable, true);
+  assert.deepEqual(slots.state.documents[0].itemIds, [itemId]);
+  assert.deepEqual(slots.state.documents[0].pendingItemIds, []);
+});
+
+test('a failed slot release is reconciled after an item is hidden', async () => {
+  const menu = createFakeCollection();
+  const item = menu.seedItem({
+    itemName: 'Stale Reservation Pizza',
+    status: MENU_STATUS.APPROVED,
+    isAvailable: true,
+  });
+  const itemId = item._id.toString();
+  const slots = createFakeMenuSlots([{ _id: VENDOR_ID, itemIds: [itemId] }]);
+  let failNextRelease = true;
+  const failingSlots = {
+    ...slots,
+    async updateOne(filter, update, options) {
+      if (failNextRelease) {
+        failNextRelease = false;
+        throw new Error('slot database temporarily unavailable');
+      }
+
+      return slots.updateOne(filter, update, options);
+    },
+  };
+  const service = createMenuService({
+    collection: () => menu,
+    slotsCollection: () => failingSlots,
+    now: () => FIXED_DATE,
+  });
+
+  await service.toggleAvailability(VENDOR_ID, itemId, users.get(VENDOR_ID));
+
+  assert.equal(menu.state.items[0].isAvailable, false);
+  assert.deepEqual(slots.state.documents[0].itemIds, []);
 });

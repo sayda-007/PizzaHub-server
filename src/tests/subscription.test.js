@@ -5,6 +5,7 @@ import express from 'express';
 import Stripe from 'stripe';
 
 import { createAuthenticate } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { createMenuService, FREE_MENU_ITEM_LIMIT } from '../modules/menu/menu.service.js';
 import { MENU_STATUS } from '../modules/menu/menu.validator.js';
@@ -132,6 +133,24 @@ function equalityFields(filter, target = {}) {
 }
 
 function applyUpdate(document, update, inserting) {
+  // MongoDB rejects an update document that writes the same path through more
+  // than one operator. The fake must model that so webhook upserts cannot hide a
+  // conflicting $setOnInsert/$set field behind Object.assign's last-write-wins.
+  const updatePaths = new Set();
+
+  for (const operator of ['$setOnInsert', '$set', '$unset']) {
+    for (const field of Object.keys(update?.[operator] ?? {})) {
+      if (updatePaths.has(field)) {
+        const error = new Error(`Updating the path '${field}' would create a conflict`);
+        error.code = 40;
+        error.codeName = 'ConflictingUpdateOperators';
+        throw error;
+      }
+
+      updatePaths.add(field);
+    }
+  }
+
   if (inserting && update?.$setOnInsert) {
     Object.assign(document, update.$setOnInsert);
   }
@@ -451,12 +470,13 @@ before(async () => {
           throw new Error('invalid test token');
         }
 
-        return { sub: subject, role: TOKEN_CLAIM_ROLES[token] };
+        return { sub: subject, sid: subject, role: TOKEN_CLAIM_ROLES[token] };
       },
       findUser: async (userId) =>
         fakeUsers.state.items.find(
           (item) => String(item._id) === String(userId) || item.id === userId,
         ) ?? null,
+      findSession: findActiveTestSession,
     },
   );
 
@@ -896,4 +916,48 @@ test('a newer paid invoice cannot be downgraded by a stale failed event', async 
     (item) => item.stripeInvoiceId === 'in_local_fake_002',
   );
   assert.equal(failedTransaction.paymentStatus, 'failed');
+});
+
+test('an equal-timestamp lower-priority failed retry cannot overwrite a paid transaction', async () => {
+  const paid = stripeEvent('invoice.paid', invoiceObject(), { created: BASE_EVENT_CREATED });
+  assert.equal((await postWebhook(paid)).status, 200);
+
+  const failed = stripeEvent('invoice.payment_failed', invoiceObject(), {
+    created: BASE_EVENT_CREATED,
+  });
+  assert.equal((await postWebhook(failed)).status, 200);
+
+  assert.equal(fakeTransactions.state.items.length, 1);
+  assert.equal(fakeTransactions.state.items[0].paymentStatus, 'paid');
+  assert.equal(fakeTransactions.state.items[0].stripeEventPriority, 30);
+  assert.equal(fakeTransactions.state.items[0].stripeEventId, paid.id);
+});
+
+test('an equal-timestamp higher-priority paid retry can replace a failed transaction', async () => {
+  const failed = stripeEvent('invoice.payment_failed', invoiceObject(), {
+    created: BASE_EVENT_CREATED,
+  });
+  assert.equal((await postWebhook(failed)).status, 200);
+
+  const paid = stripeEvent('invoice.paid', invoiceObject(), { created: BASE_EVENT_CREATED });
+  assert.equal((await postWebhook(paid)).status, 200);
+
+  assert.equal(fakeTransactions.state.items.length, 1);
+  assert.equal(fakeTransactions.state.items[0].paymentStatus, 'paid');
+  assert.equal(fakeTransactions.state.items[0].stripeEventPriority, 30);
+  assert.equal(fakeTransactions.state.items[0].stripeEventId, paid.id);
+});
+
+test('the fake collection rejects conflicting update paths like real MongoDB', async () => {
+  const collection = createFakeCollection();
+
+  await assert.rejects(
+    () =>
+      collection.updateOne(
+        { _id: 'fake-update-conflict' },
+        { $setOnInsert: { shared: 'insert' }, $set: { shared: 'update' } },
+        { upsert: true },
+      ),
+    { code: 40, codeName: 'ConflictingUpdateOperators' },
+  );
 });

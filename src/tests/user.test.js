@@ -5,6 +5,7 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 
 import { createAuthenticate } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { createUserRoutes } from '../modules/user/user.routes.js';
 import { createUserService } from '../modules/user/user.service.js';
@@ -123,9 +124,10 @@ before(async () => {
           throw new Error('invalid test token');
         }
 
-        return { sub: subject };
+        return { sub: subject, sid: subject };
       },
       findUser: async (userId) => users.get(userId) ?? null,
+      findSession: findActiveTestSession,
     },
   );
 

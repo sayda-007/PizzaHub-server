@@ -5,14 +5,18 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 
 import { createAuthenticate } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
+import { createFakeMenuSlots } from './menu-slot-fake.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { createAdminMenuRoutes } from '../modules/admin/admin-menu.routes.js';
 import {
   ADMIN_MENU_PROJECTION,
   createAdminMenuService,
 } from '../modules/admin/admin-menu.service.js';
+import { createMenuSlotService } from '../modules/menu/menu-slots.js';
 import { createMenuRoutes } from '../modules/menu/menu.routes.js';
 import {
+  FREE_MENU_ITEM_LIMIT,
   buildSlotFilter,
   createMenuService,
 } from '../modules/menu/menu.service.js';
@@ -254,13 +258,15 @@ function createFakeCollection() {
 
     async updateOne(filter, update) {
       record('updateOne', { filter, update });
-      const item = state.items.find((candidate) => matches(filter, candidate));
+      const index = state.items.findIndex((candidate) => matches(filter, candidate));
 
-      if (!item) {
+      if (index === -1) {
         return { matchedCount: 0 };
       }
 
-      Object.assign(item, update.$set);
+      // MongoDB returns a document snapshot to the caller; mutating the same
+      // in-memory object would make a pre-update snapshot appear updated.
+      state.items[index] = { ...state.items[index], ...update.$set };
 
       return { matchedCount: 1 };
     },
@@ -283,6 +289,7 @@ function createFakeCollection() {
 }
 
 let fakeCollection;
+let fakeSlots;
 let server;
 let baseUrl;
 const originalConsoleError = console.error;
@@ -323,6 +330,7 @@ async function expectStatus(response, status, code) {
 before(async () => {
   console.error = () => {};
   fakeCollection = createFakeCollection();
+  fakeSlots = createFakeMenuSlots();
 
   // Every token deliberately claims the admin role. authenticate() must ignore
   // JWT claims and reload the role from the fake MongoDB user map above.
@@ -338,6 +346,7 @@ before(async () => {
 
         return {
           sub: subject,
+          sid: subject,
           role: 'admin',
           subscriptionPlan: 'premium',
           subscriptionStatus: 'active',
@@ -345,15 +354,20 @@ before(async () => {
         };
       },
       findUser: async (userId) => users.get(userId) ?? null,
+      findSession: findActiveTestSession,
     },
   );
 
+  // Match app.js: route tests must exercise the atomic slots collection, not
+  // the legacy count fallback used when no slotsCollection is injected.
   const adminMenuService = createAdminMenuService({
     collection: () => fakeCollection,
+    slotsCollection: () => fakeSlots,
     now: () => FIXED_DATE,
   });
   const menuService = createMenuService({
     collection: () => fakeCollection,
+    slotsCollection: () => fakeSlots,
     now: () => FIXED_DATE,
   });
 
@@ -382,6 +396,10 @@ beforeEach(() => {
   const fresh = createFakeCollection();
   fakeCollection.state.items = fresh.state.items;
   fakeCollection.state.calls = fresh.state.calls;
+
+  const freshSlots = createFakeMenuSlots();
+  fakeSlots.state.documents = freshSlots.state.documents;
+  fakeSlots.state.calls = freshSlots.state.calls;
 });
 
 after(async () => {
@@ -716,6 +734,7 @@ test('an admin can reject a pending item', async () => {
     _id: new ObjectId(ITEM_ID),
     status: MENU_STATUS.PENDING,
   });
+  fakeSlots.state.documents.push({ _id: VENDOR_ID, itemIds: [ITEM_ID] });
 
   const response = await sendJson(
     'PATCH',
@@ -732,6 +751,9 @@ test('an admin can reject a pending item', async () => {
 
   assert.deepEqual(Object.keys(update.update.$set).sort(), ['status', 'updatedAt']);
   assert.equal(update.update.$set.status, MENU_STATUS.REJECTED);
+
+  // Moderation releases the production atomic reservation as well.
+  assert.deepEqual(fakeSlots.state.documents[0].itemIds, []);
 });
 
 test('non-pending items cannot be moderated again', async () => {
@@ -886,4 +908,132 @@ test('existing vendor menu routes remain protected', async () => {
 
   assert.equal(response.status, 200);
   assert.deepEqual((await response.json()).items, []);
+});
+
+test('concurrent admin availability restores reserve only three free-plan slots', async () => {
+  const menu = createFakeCollection();
+  const slots = createFakeMenuSlots();
+  const service = createAdminMenuService({
+    collection: () => menu,
+    usersCollection: {
+      async findOne() {
+        return users.get(VENDOR_ID);
+      },
+    },
+    slotsCollection: () => slots,
+    now: () => FIXED_DATE,
+  });
+
+  const items = Array.from({ length: FREE_MENU_ITEM_LIMIT + 1 }, (_, index) =>
+    menu.seedItem({
+      _id: new ObjectId(`65c0000000000000000000${String(index + 20).padStart(2, '0')}`),
+      itemName: `Admin Hidden Pizza ${index + 1}`,
+      status: MENU_STATUS.APPROVED,
+      isAvailable: false,
+    }),
+  );
+
+  const results = await Promise.allSettled(
+    items.map((item) => service.setPublishedAvailability(item._id.toString(), { isAvailable: true })),
+  );
+
+  assert.equal(results.filter((result) => result.status === 'fulfilled').length, FREE_MENU_ITEM_LIMIT);
+  assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+  assert.equal(
+    results.find((result) => result.status === 'rejected').reason.code,
+    'MENU_ITEM_LIMIT_REACHED',
+  );
+  assert.equal(menu.state.items.filter((item) => item.isAvailable).length, FREE_MENU_ITEM_LIMIT);
+});
+
+test('a reconciliation racing an admin availability restore keeps the reserved slot', async () => {
+  const menu = createFakeCollection();
+  const item = menu.seedItem({
+    _id: new ObjectId('65c000000000000000000028'),
+    itemName: 'Race Admin Restore Pizza',
+    status: MENU_STATUS.APPROVED,
+    isAvailable: false,
+  });
+  const itemId = item._id.toString();
+  const slots = createFakeMenuSlots();
+  const slotService = createMenuSlotService({ collection: slots });
+  let reserveObserved = false;
+  const observingSlots = {
+    ...slots,
+    async findOneAndUpdate(filter, update, options) {
+      const result = await slots.findOneAndUpdate(filter, update, options);
+
+      if (result) {
+        reserveObserved = true;
+      }
+
+      return result;
+    },
+  };
+  const interleavedMenu = {
+    ...menu,
+    async updateOne(filter, update, options) {
+      if (reserveObserved && Object.hasOwn(update?.$set ?? {}, 'isAvailable')) {
+        // Runs after the slot is reserved but before the document is active.
+        await slotService.reconcile(item.vendorId, []);
+      }
+
+      return menu.updateOne(filter, update, options);
+    },
+  };
+  const service = createAdminMenuService({
+    collection: () => interleavedMenu,
+    usersCollection: {
+      async findOne() {
+        return users.get(item.vendorId);
+      },
+    },
+    slotsCollection: () => observingSlots,
+    now: () => FIXED_DATE,
+  });
+
+  await service.setPublishedAvailability(itemId, { isAvailable: true });
+
+  assert.equal(menu.state.items[0].isAvailable, true);
+  assert.deepEqual(slots.state.documents[0].itemIds, [itemId]);
+  assert.deepEqual(slots.state.documents[0].pendingItemIds, []);
+});
+
+test('a failed admin slot release is reconciled after rejection', async () => {
+  const menu = createFakeCollection();
+  const item = menu.seedItem({
+    itemName: 'Stale Admin Reservation Pizza',
+    status: MENU_STATUS.PENDING,
+    isAvailable: true,
+  });
+  const itemId = item._id.toString();
+  const vendorId = item.vendorId;
+  const slots = createFakeMenuSlots([{ _id: vendorId, itemIds: [itemId] }]);
+  let failNextRelease = true;
+  const failingSlots = {
+    ...slots,
+    async updateOne(filter, update, options) {
+      if (failNextRelease) {
+        failNextRelease = false;
+        throw new Error('slot database temporarily unavailable');
+      }
+
+      return slots.updateOne(filter, update, options);
+    },
+  };
+  const service = createAdminMenuService({
+    collection: () => menu,
+    usersCollection: {
+      async findOne() {
+        return users.get(vendorId);
+      },
+    },
+    slotsCollection: () => failingSlots,
+    now: () => FIXED_DATE,
+  });
+
+  const updated = await service.moderate(itemId, { status: MENU_STATUS.REJECTED });
+
+  assert.equal(updated.status, MENU_STATUS.REJECTED);
+  assert.deepEqual(slots.state.documents[0].itemIds, []);
 });

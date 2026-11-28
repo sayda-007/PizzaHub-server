@@ -1,11 +1,12 @@
 import { getMenuItemsCollection, getUsersCollection } from '../../database/collections.js';
 import { buildUserIdFilter } from '../../middlewares/authenticate.js';
 import { ApiError } from '../../utils/api-error.js';
+import { createMenuSlotService, MENU_SLOT_LIMIT } from '../menu/menu-slots.js';
 import {
-  FREE_MENU_ITEM_LIMIT,
   buildMenuIdFilter,
   buildSlotFilter,
   isPremiumSubscription,
+  menuItemConsumesSlot,
   serializeMenu,
 } from '../menu/menu.service.js';
 import {
@@ -81,6 +82,11 @@ export function createAdminMenuService(dependencies = {}) {
   const collectionSource = dependencies.collection;
   const usersSource = dependencies.usersCollection ?? dependencies.users;
   const now = dependencies.now ?? (() => new Date());
+  const slotService =
+    dependencies.slotService ??
+    (dependencies.slotsCollection
+      ? createMenuSlotService({ collection: dependencies.slotsCollection })
+      : null);
 
   function getCollection() {
     if (typeof collectionSource === 'function') {
@@ -96,6 +102,92 @@ export function createAdminMenuService(dependencies = {}) {
     }
 
     return usersSource ?? getUsersCollection();
+  }
+
+  async function currentSlotItemIds(vendorId) {
+    const documents = await getCollection()
+      .find(buildSlotFilter(vendorId))
+      .project({ _id: 1 })
+      .toArray();
+
+    return documents.map((document) => document._id?.toString?.() ?? document.id);
+  }
+
+  /** Make the reservation document match the items that really consume slots. */
+  async function reconcileSlots(vendorId, options) {
+    if (!slotService?.reconcile) {
+      return;
+    }
+
+    await slotService.reconcile(vendorId, await currentSlotItemIds(vendorId), options);
+  }
+
+  /** Clear an in-flight marker only after the menu document consumes a slot. */
+  async function confirmItem(vendorId, itemId) {
+    if (!slotService?.confirm) {
+      return;
+    }
+
+    try {
+      await slotService.confirm(vendorId, itemId);
+    } catch {
+      // A later reconciliation can still drop markers that match actual items.
+    }
+  }
+
+  /**
+   * A release failure must not leave a stale reservation behind. Reconciliation
+   * is authoritative, so moderation can succeed even when the incremental $pull
+   * failed.
+   */
+  async function releaseItem(existing) {
+    if (!slotService) {
+      return;
+    }
+
+    const vendorId = existing.vendorId;
+    const itemId = existing._id?.toString?.() ?? existing.id;
+
+    try {
+      await slotService.release(vendorId, itemId);
+    } catch {
+      // Healed by the authoritative reconciliation below.
+    }
+
+    await reconcileSlots(vendorId, { forceRemoveItemIds: [itemId] });
+  }
+
+  async function reserveItem(existing, options = {}) {
+    if (!slotService) {
+      return false;
+    }
+
+    const vendorId = existing.vendorId;
+    const itemId = existing._id?.toString?.() ?? existing.id;
+
+    await reconcileSlots(vendorId);
+
+    if (await slotService.has(vendorId, itemId)) {
+      return false;
+    }
+
+    const vendor = await getUsers().findOne(buildUserIdFilter(vendorId), {
+      projection: {
+        subscriptionPlan: 1,
+        subscriptionStatus: 1,
+        subscriptionExpiresAt: 1,
+      },
+    });
+
+    await slotService.reserve({
+      vendorId,
+      itemId,
+      unlimited: isPremiumSubscription(vendor, now()),
+      existingItemIds: await currentSlotItemIds(vendorId),
+      pending: options.pending === true,
+    });
+
+    return true;
   }
 
   async function listAdmin(query) {
@@ -154,6 +246,11 @@ export function createAdminMenuService(dependencies = {}) {
       throw ApiError.conflict(NOT_PENDING_MESSAGE, 'MENU_ITEM_NOT_PENDING');
     }
 
+    // Rejection removes the item from public visibility and frees its slot.
+    if (targetStatus === MENU_STATUS.REJECTED && menuItemConsumesSlot(existing)) {
+      await releaseItem(existing);
+    }
+
     const updated = await collection.findOne(idFilter);
 
     if (!updated) {
@@ -189,25 +286,33 @@ export function createAdminMenuService(dependencies = {}) {
       return serializeMenu(existing);
     }
 
+    let reserved = false;
+
     if (isAvailable) {
-      const vendor = await getUsers().findOne(buildUserIdFilter(existing.vendorId), {
-        projection: {
-          subscriptionPlan: 1,
-          subscriptionStatus: 1,
-          subscriptionExpiresAt: 1,
-        },
-      });
+      // The document is still hidden here, so the slot must be marked pending
+      // until the availability update commits.
+      reserved = await reserveItem(existing, { pending: true });
 
-      if (!isPremiumSubscription(vendor, now())) {
-        const usedSlots = await collection.countDocuments(
-          buildSlotFilter(existing.vendorId, idFilter._id),
-        );
+      if (!slotService) {
+        const vendor = await getUsers().findOne(buildUserIdFilter(existing.vendorId), {
+          projection: {
+            subscriptionPlan: 1,
+            subscriptionStatus: 1,
+            subscriptionExpiresAt: 1,
+          },
+        });
 
-        if (usedSlots >= FREE_MENU_ITEM_LIMIT) {
-          throw ApiError.conflict(
-            `Free plan allows ${FREE_MENU_ITEM_LIMIT} active menu items.`,
-            'MENU_ITEM_LIMIT_REACHED',
+        if (!isPremiumSubscription(vendor, now())) {
+          const usedSlots = await collection.countDocuments(
+            buildSlotFilter(existing.vendorId, idFilter._id),
           );
+
+          if (usedSlots >= MENU_SLOT_LIMIT) {
+            throw ApiError.conflict(
+              `Free plan allows ${MENU_SLOT_LIMIT} active menu items.`,
+              'MENU_ITEM_LIMIT_REACHED',
+            );
+          }
         }
       }
     }
@@ -218,16 +323,34 @@ export function createAdminMenuService(dependencies = {}) {
     );
 
     if ((result?.matchedCount ?? 0) === 0) {
+      if (reserved) {
+        await releaseItem(existing);
+      }
+
       throw ApiError.conflict(
         'Only published menu items can have Admin availability changed.',
         'MENU_ITEM_NOT_PUBLISHED',
       );
     }
 
+    if (!isAvailable) {
+      await releaseItem(existing);
+    }
+
     const updated = await collection.findOne(idFilter);
 
     if (!updated) {
+      if (reserved && isAvailable) {
+        await releaseItem(existing);
+      }
+
       throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    if (reserved && isAvailable) {
+      const vendorId = existing.vendorId;
+      const itemId = existing._id?.toString?.() ?? existing.id;
+      await confirmItem(vendorId, itemId);
     }
 
     return serializeMenu(updated);
@@ -235,10 +358,15 @@ export function createAdminMenuService(dependencies = {}) {
 
   async function remove(id) {
     const filter = buildMenuIdFilter(id);
+    const existing = await getCollection().findOne(filter);
     const result = await getCollection().deleteOne(filter);
 
     if ((result?.deletedCount ?? 0) === 0) {
       throw ApiError.notFound('Menu item not found.', 'MENU_ITEM_NOT_FOUND');
+    }
+
+    if (existing && slotService) {
+      await releaseItem(existing);
     }
 
     return { id: String(id) };

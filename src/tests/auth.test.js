@@ -14,7 +14,10 @@ import { normalizeBaseUrl } from '../config/env.js';
 import {
   buildUserIdFilter,
   createAuthenticate,
+  findSessionById,
   findUserById,
+  isActiveSession,
+  SESSION_ID_CLAIM,
 } from '../middlewares/authenticate.js';
 import { requireRole } from '../middlewares/authorize.js';
 import { createErrorHandler } from '../middlewares/error.js';
@@ -25,6 +28,11 @@ const USER_ID = '65b000000000000000000001';
 const BLOCKED_USER_ID = '65b000000000000000000002';
 const VENDOR_USER_ID = '65b000000000000000000003';
 const MISSING_USER_ID = '65b000000000000000000099';
+const REVOKED_SESSION_ID = '65c000000000000000000001';
+const EXPIRED_SESSION_ID = '65c000000000000000000002';
+const OTHER_USER_SESSION_ID = '65c000000000000000000003';
+const FUTURE_SESSION_EXPIRY = '2099-01-01T00:00:00.000Z';
+const PAST_SESSION_EXPIRY = '2000-01-01T00:00:00.000Z';
 
 const { publicKey, privateKey } = await generateKeyPair('EdDSA', { extractable: true });
 const { privateKey: otherPrivateKey } = await generateKeyPair('EdDSA', { extractable: true });
@@ -50,7 +58,9 @@ async function signToken(options = {}) {
   const now = Math.floor(Date.now() / 1000);
   const {
     subject = USER_ID,
+    sessionId = subject,
     omitSubject = false,
+    omitSessionId = false,
     role = 'customer',
     issuer = AUTH_URL,
     audience = AUTH_URL,
@@ -59,13 +69,15 @@ async function signToken(options = {}) {
     kid = KEY_ID,
   } = options;
 
-  const token = new SignJWT({
+  const payload = {
     role,
     subscriptionPlan: 'premium',
     subscriptionStatus: 'active',
     isBlocked: false,
     passwordHash: 'must-not-be-trusted',
-  }).setProtectedHeader({ alg: 'EdDSA', kid });
+    ...(omitSessionId ? {} : { [SESSION_ID_CLAIM]: sessionId }),
+  };
+  const token = new SignJWT(payload).setProtectedHeader({ alg: 'EdDSA', kid });
 
   if (!omitSubject) {
     token.setSubject(subject);
@@ -118,6 +130,22 @@ const users = new Map([
   ],
 ]);
 
+const sessions = new Map(
+  [USER_ID, BLOCKED_USER_ID, VENDOR_USER_ID, MISSING_USER_ID].map((userId) => [
+    userId,
+    { userId, expiresAt: FUTURE_SESSION_EXPIRY },
+  ]),
+);
+
+sessions.set(EXPIRED_SESSION_ID, {
+  userId: USER_ID,
+  expiresAt: PAST_SESSION_EXPIRY,
+});
+sessions.set(OTHER_USER_SESSION_ID, {
+  userId: VENDOR_USER_ID,
+  expiresAt: FUTURE_SESSION_EXPIRY,
+});
+
 let failDatabase = false;
 let server;
 let baseUrl;
@@ -139,6 +167,8 @@ before(async () => {
 
         return users.get(userId) ?? null;
       },
+      findSession: async (sessionId) => sessions.get(sessionId) ?? null,
+      now: () => new Date(),
     },
   );
 
@@ -278,6 +308,7 @@ test('a valid token returns its verified claims', async () => {
   const claims = await verifier(await signToken());
 
   assert.equal(claims.sub, USER_ID);
+  assert.equal(claims[SESSION_ID_CLAIM], USER_ID);
   assert.equal(claims.iss, AUTH_URL);
   assert.equal(claims.aud, AUTH_URL);
 });
@@ -358,6 +389,39 @@ test('user lookup accepts ObjectId and string ids without assuming one format', 
   assert.deepEqual(filters[1], { _id: 'legacy-string-id' });
 });
 
+test('session lookup accepts ObjectId and string ids without assuming one format', async () => {
+  const filters = [];
+  const collection = {
+    findOne: async (filter) => {
+      filters.push(filter);
+      return null;
+    },
+  };
+
+  assert.equal(findSessionById('', collection), null);
+
+  await findSessionById(EXPIRED_SESSION_ID, collection);
+  assert.ok(filters[0]._id.$in[0] instanceof ObjectId);
+  assert.equal(filters[0]._id.$in[0].toHexString(), EXPIRED_SESSION_ID);
+  assert.equal(filters[0]._id.$in[1], EXPIRED_SESSION_ID);
+
+  await findSessionById('legacy-session-id', collection);
+  assert.deepEqual(filters[1], { _id: 'legacy-session-id' });
+});
+
+test('an active session must belong to the token subject and be unexpired', () => {
+  const now = new Date('2026-01-01T00:00:00.000Z');
+  const session = { userId: USER_ID, expiresAt: FUTURE_SESSION_EXPIRY };
+
+  assert.equal(isActiveSession(session, USER_ID, now), true);
+  assert.equal(isActiveSession(session, VENDOR_USER_ID, now), false);
+  assert.equal(isActiveSession(null, USER_ID, now), false);
+  assert.equal(
+    isActiveSession({ userId: USER_ID, expiresAt: PAST_SESSION_EXPIRY }, USER_ID, now),
+    false,
+  );
+});
+
 test('a missing Authorization header returns 401', async () => {
   const body = await expectStatus(await request('/me'), 401, 'UNAUTHORIZED');
 
@@ -403,6 +467,25 @@ test('a user missing from MongoDB returns 401', async () => {
   const body = await expectStatus(await bearerGet('/me', token), 401, 'UNAUTHORIZED');
 
   assert.equal(body.message, 'User no longer exists.');
+});
+
+test('a token without a session id returns 401', async () => {
+  const token = await signToken({ omitSessionId: true });
+  const body = await expectStatus(await bearerGet('/me', token), 401, 'UNAUTHORIZED');
+
+  assert.equal(body.message, 'Invalid or expired token.');
+});
+
+test('revoked, expired and wrong-user sessions return 401', async () => {
+  const tokens = [
+    await signToken({ sessionId: REVOKED_SESSION_ID }),
+    await signToken({ sessionId: EXPIRED_SESSION_ID }),
+    await signToken({ sessionId: OTHER_USER_SESSION_ID }),
+  ];
+
+  for (const token of tokens) {
+    await expectStatus(await bearerGet('/me', token), 401, 'UNAUTHORIZED');
+  }
 });
 
 test('a valid user receives a sanitized req.user', async () => {

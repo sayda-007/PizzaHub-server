@@ -5,6 +5,7 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 
 import { createAuthenticate } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { MENU_STATUS } from '../modules/menu/menu.validator.js';
 import {
@@ -441,9 +442,10 @@ before(async () => {
           throw new Error('invalid test token');
         }
 
-        return { sub: subject, role: TOKEN_CLAIM_ROLES[token] };
+        return { sub: subject, sid: subject, role: TOKEN_CLAIM_ROLES[token] };
       },
       findUser: async (userId) => users.get(userId) ?? null,
+      findSession: findActiveTestSession,
     },
   );
 

@@ -305,13 +305,17 @@ All failures share one envelope:
 
 `src/middlewares/rate-limit.js` exports `createApiLimiter(env)`:
 
-| Environment | Requests per 15-minute window |
-| --- | --- |
-| `development` | 500 |
-| `test` | 10,000 |
-| `production` | 100 |
+| Environment | General API requests per 15-minute window | Credential requests | Session maintenance requests |
+| --- | --- | --- | --- |
+| `development` | 500 | 500 | 5,000 |
+| `test` | 10,000 | 10,000 | 100,000 |
+| `production` | 100 | 100 | 1,000 |
 
-IETF draft-7 `RateLimit` and `RateLimit-Policy` headers are emitted, along with `Retry-After` when throttled. `/api/health` is exempt so monitoring probes are never throttled. When the limit is exceeded, the limiter passes an `ApiError(429, …, 'RATE_LIMITED')` to the centralized handler, giving the same JSON shape as every other error. The limiter uses the default in-process memory store; a shared store would be needed if the API is later scaled across multiple instances.
+`GET /api/auth/token`, `GET /api/auth/get-session` and `GET /api/auth/jwks` use a session-maintenance bucket so normal refreshes cannot exhaust the budget needed by sign-in and business endpoints. Credential submissions (`/api/auth/sign-in/email`, `/api/auth/sign-in/social` and `/api/auth/sign-up/email`) use their own bucket, so a burst of menu or order traffic cannot return 429 before a vendor's password is checked. All three buckets remain per IP, and credential brute-force protection is unchanged.
+
+IETF draft-7 `RateLimit` and `RateLimit-Policy` headers are emitted, along with `Retry-After` when throttled. `/api/health` is exempt so monitoring probes are never throttled. When the limit is exceeded, the limiter passes an `ApiError(429, …, 'RATE_LIMITED')` to the centralized handler, giving the same JSON shape as every other error.
+
+**Serverless limitation:** the limiter uses `express-rate-limit`'s default in-process memory store. On Vercel each warm serverless instance therefore has its own counter; the configured number is per instance per IP, not a global project-wide ceiling, and counters reset when an instance is recycled. Do not treat it as strict distributed brute-force protection. If a project-wide limit becomes a requirement, configure a shared external store (for example `@upstash/ratelimit` with Redis, or `rate-limit-redis` as the `express-rate-limit` store). Keep Vercel Firewall/WAF rules as the platform-level outer layer.
 
 Rate limiting has no dedicated environment variable. Authentication variables are listed below.
 
@@ -367,8 +371,8 @@ Better Auth owns every `/api/auth/*` route; the table lists the ones used in thi
 | `MONGODB_URI` | **Milestone 2 — required** | Atlas `mongodb+srv://` connection string; secret, never commit |
 | `MONGODB_DB_NAME` | **Milestone 2 — required** | Database name selected on connect |
 | `BETTER_AUTH_SECRET` | **Milestone 5 — required** | At least 32 random characters; placeholders rejected; server-side only |
-| `BETTER_AUTH_URL` | **Milestone 5 — required** | Public URL of this API; base for OAuth callbacks and JWT issuer/audience |
-| `CLIENT_URL` | **Milestone 5 — required** | Trusted browser origin for the future Next.js client |
+| `BETTER_AUTH_URL` | **Milestone 5 — required** | Public auth origin the browser sees; base for OAuth callbacks and JWT issuer/audience. Use the frontend origin with the Next.js rewrite; use the API origin only when calling the API directly |
+| `CLIENT_URL` | **Milestone 5 — required** | Trusted browser origin for the Next.js client |
 | `GOOGLE_CLIENT_ID` | Milestone 5 — optional | OAuth credential; both Google variables must be real or both unset |
 | `GOOGLE_CLIENT_SECRET` | Milestone 5 — optional | OAuth credential, server-side only |
 | `STRIPE_SECRET_KEY` | Premium subscriptions | Required with the other two Stripe values; server-side only |
@@ -395,12 +399,12 @@ Set these environment variables in Vercel (names only; never commit values):
 | Optional uploads | `IMGBB_API_KEY` |
 | Manual admin seed only | `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` |
 
-`PORT` is supplied by Vercel and `NODE_ENV` is set to production by the platform; neither needs a repository value. For the planned same-origin frontend rewrite, set both `BETTER_AUTH_URL` and `CLIENT_URL` to the public frontend origin. The Next.js app rewrites `/api/:path*` to the generated backend deployment URL; that URL is only the rewrite upstream, not the public auth origin. This keeps Better Auth callbacks, cookies, JWT issuer/audience and the JWKS URL first-party, so the existing `SameSite=Lax` cookies do not need a cross-site change.
+`PORT` is supplied by Vercel and `NODE_ENV` is set to production by the platform; neither needs a repository value. For the current same-origin frontend rewrite, set both `BETTER_AUTH_URL` and `CLIENT_URL` to the public frontend origin. The Next.js app rewrites `/api/:path*` to the generated backend deployment URL; that URL is only the rewrite upstream, not the public auth origin. This keeps Better Auth callbacks, cookies, JWT issuer/audience and the JWKS URL first-party, so the existing `SameSite=Lax` cookies do not need a cross-site change. If the rewrite is removed and the browser calls the API directly instead, set `BETTER_AUTH_URL` to that API origin and `CLIENT_URL` to the frontend origin, then revisit cross-site cookie settings deliberately; do not mix the two architectures.
 
 Runtime notes:
 
 - MongoDB reuses one `MongoClient` and one cached connection promise across warm invocations. Index initialization stays at startup, with no per-request connection or disconnect.
-- `trust proxy` uses a single hop so rate limiting reads Vercel's client IP and secure-cookie detection sees the forwarded HTTPS scheme, without trusting arbitrary forwarded chains. The in-memory limiter is per warm instance, not global; global controls belong in Vercel Firewall rather than a new datastore.
+- `trust proxy` uses a single hop so rate limiting reads Vercel's client IP and secure-cookie detection sees the forwarded HTTPS scheme, without trusting arbitrary forwarded chains. The in-memory limiter is per warm instance, not global; global controls belong in Vercel Firewall, and a shared Redis-backed store is the recommended upgrade when a true cross-instance ceiling is required. Session maintenance endpoints use a separate bucket from sign-in/sign-up and business APIs.
 - Upload buffers stay in memory and go straight to ImgBB; nothing is written to the function filesystem. Keep multipart requests below the platform's standard limit, as described in [ImgBB upload flow and limits](#imgbb-upload-flow-and-limits).
 - Stripe, ImgBB and Google remain optional exactly as they are locally. Set the same variables for Preview deployments that should exercise those integrations.
 
@@ -440,6 +444,7 @@ Google is opt-in. Leave both `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET` unset
 - `jwtVerify()` checks the signature, expiration, issuer and audience. Better Auth uses `BETTER_AUTH_URL` as both issuer and audience by default, so the verifier uses the same value.
 - The configured Better Auth `jwt()` call does not override `keyPairConfig.alg`; the plugin default is **EdDSA with Ed25519**. Verification explicitly allows only `EdDSA`, preventing algorithm confusion.
 - A token must have a non-empty `sub`. Better Auth sets it to the user id.
+- `authenticate` also requires a non-empty `sid` claim and checks that the referenced Better Auth session still exists. Signing out therefore invalidates JWTs that were minted earlier. Tokens minted before this `sid` check was introduced are rejected; deploy the client and backend together and let browser token caches refresh after rollout.
 - Verification failures become one generic internal error. No token, key, claim or library error text is sent to the client or logged by this module.
 
 There is no second JWT secret and no duplicate auth system: the same Better Auth keys and configuration are the source of truth.
@@ -856,7 +861,7 @@ Stripe is used only for vendor Premium subscriptions, never for pizza orders. Th
 
 ## Deployment
 
-Run one Node 22.9+ process behind an HTTPS reverse proxy. The API does not serve the frontend; `CLIENT_URL` is the trusted browser origin used by CORS and Checkout redirects, while `BETTER_AUTH_URL` is this API's public URL and the JWT issuer/audience. Both must match the deployed origins, and cross-origin cookies/auth require HTTPS in production.
+Run one Node 22.9+ process behind an HTTPS reverse proxy. The API does not serve the frontend. `CLIENT_URL` is the trusted browser origin used by CORS and Checkout redirects. `BETTER_AUTH_URL` is the public auth origin the browser sees and the JWT issuer/audience: with the current Next.js rewrite it is the frontend origin; when the API is called directly it is the API origin. Both must match the deployed architecture, and cross-origin cookies/auth require HTTPS in production.
 
 Supply every secret through environment variables or the platform's secret manager: `MONGODB_URI`, `MONGODB_DB_NAME`, `BETTER_AUTH_SECRET`, `BETTER_AUTH_URL`, `CLIENT_URL`, the three Stripe values, and optionally `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` and `IMGBB_API_KEY`. Never commit `.env`; only `.env.example` is tracked. Restart with a real Admin password after running the manual `npm run seed:admin` step; the server itself never creates an Admin.
 

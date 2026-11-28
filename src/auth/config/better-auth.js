@@ -70,6 +70,124 @@ function isPublicRegistrationRole(value) {
   return PUBLIC_REGISTRATION_ROLES.includes(value);
 }
 
+const BLOCKED_USER_MESSAGE = 'This account is blocked.';
+const SESSION_VERIFICATION_MESSAGE = 'Unable to verify account status before creating a session.';
+
+export const BLOCKED_SESSION_PLUGIN_ID = 'pizzahub-blocked-session-guard';
+
+function blockedUserError() {
+  return new APIError('FORBIDDEN', { message: BLOCKED_USER_MESSAGE });
+}
+
+function sessionVerificationError() {
+  return new APIError('INTERNAL_SERVER_ERROR', { message: SESSION_VERIFICATION_MESSAGE });
+}
+
+function isBlockedUser(user) {
+  return user?.isBlocked === true;
+}
+
+/**
+ * Database-level guard for every session-creation path, including OAuth
+ * callbacks and verification flows that never pass through the request hooks.
+ * Exported so the decision can be regression-tested without a real provider.
+ *
+ * Prefer the endpoint context Better Auth supplies. The plugin passes the
+ * initialized auth context as a fallback for direct internal-adapter calls.
+ * If neither can look up the user, fail closed: no session cookie is safer
+ * than issuing one whose blocked status was never checked.
+ */
+export async function rejectBlockedSessionCreation(session, context, fallbackAdapter) {
+  const internalAdapter = context?.context?.internalAdapter ?? fallbackAdapter;
+
+  if (!internalAdapter?.findUserById) {
+    throw sessionVerificationError();
+  }
+
+  const user = await internalAdapter.findUserById(session?.userId);
+
+  if (!user || typeof user !== 'object') {
+    throw sessionVerificationError();
+  }
+
+  if (isBlockedUser(user)) {
+    throw blockedUserError();
+  }
+}
+
+/**
+ * Better Auth merges plugin database hooks with the top-level hooks and runs
+ * each one, so this guard cannot be replaced by an options-level handler.
+ */
+function blockedSessionGuardPlugin() {
+  return {
+    id: BLOCKED_SESSION_PLUGIN_ID,
+    init(authContext) {
+      return {
+        options: {
+          databaseHooks: {
+            session: {
+              create: {
+                before: (session, context) =>
+                  rejectBlockedSessionCreation(session, context, authContext?.internalAdapter),
+              },
+            },
+          },
+        },
+      };
+    },
+  };
+}
+
+/** Better Auth endpoints that consume an existing session and must reject blocked users. */
+const SESSION_CONSUMING_PATHS = new Set([
+  '/get-session',
+  '/token',
+  '/update-user',
+  '/change-password',
+  '/change-email',
+  '/list-sessions',
+  '/revoke-session',
+  '/revoke-sessions',
+  '/revoke-other-sessions',
+  '/delete-user',
+]);
+
+/**
+ * Read the authenticated user from a route's result. `/sign-in/email` returns
+ * the user in the response body but does not populate ctx.context.user, while
+ * session-based routes populate ctx.context.session.user. Both are checked.
+ */
+async function userFromAuthResult(ctx) {
+  const directUser = ctx.context.user ?? ctx.context.session?.user;
+
+  if (directUser) {
+    return directUser;
+  }
+
+  const returned = ctx.context.returned;
+
+  if (!returned || returned instanceof Error) {
+    return null;
+  }
+
+  let result = returned;
+
+  if (typeof Response !== 'undefined' && result instanceof Response) {
+    if (result.status < 200 || result.status >= 300) {
+      return null;
+    }
+
+    try {
+      result = await result.clone().json();
+    } catch {
+      return null;
+    }
+  }
+
+  return result && typeof result === 'object' ? result.user ?? null : null;
+}
+
 /**
  * A direct `auth.api.*` call has no HTTP request or headers. Express always
  * supplies both to Better Auth, so this is the narrow, documented signal that
@@ -190,7 +308,27 @@ export function createAuth(env, options = {}) {
 
     socialProviders,
 
-    plugins: [jwt()],
+    // The JWT carries the Better Auth session id. Business APIs verify that the
+    // session still exists and is unexpired, so sign-out revokes tokens before
+    // their natural 15-minute expiry instead of leaving them usable.
+    plugins: [
+      blockedSessionGuardPlugin(),
+      jwt({
+        jwt: {
+          definePayload: (session) => ({
+            name: session.user.name,
+            email: session.user.email,
+            image: session.user.image,
+            role: session.user.role,
+            businessName: session.user.businessName,
+            subscriptionPlan: session.user.subscriptionPlan,
+            subscriptionStatus: session.user.subscriptionStatus,
+            subscriptionExpiresAt: session.user.subscriptionExpiresAt,
+            sid: session.session.id,
+          }),
+        },
+      }),
+    ],
 
     user: {
       // Better Auth's `user` model is stored in the assignment's `users` collection.
@@ -276,13 +414,28 @@ export function createAuth(env, options = {}) {
       before: createAuthMiddleware(async (ctx) => {
         const isRegistration = typeof ctx.path === 'string' && ctx.path.startsWith('/sign-up');
         const isEmailRegistration = ctx.path === '/sign-up/email';
+        const isEmailSignIn = ctx.path === '/sign-in/email';
         const isProfileUpdate = ctx.path === '/update-user';
+        const isPasswordChange = ctx.path === '/change-password';
 
-        if (!isRegistration && !isProfileUpdate) {
+        if (!isRegistration && !isEmailSignIn && !isProfileUpdate && !isPasswordChange) {
           return;
         }
 
         const body = ctx.body && typeof ctx.body === 'object' ? ctx.body : {};
+
+        // Reject a blocked account before a session is created, so no session
+        // cookie is issued even though the HTTP response is a clean 403.
+        if (isEmailSignIn && typeof body.email === 'string') {
+          const found = await ctx.context.internalAdapter.findUserByEmail(
+            body.email.toLowerCase(),
+          );
+          const existingUser = found?.user ?? found;
+
+          if (isBlockedUser(existingUser)) {
+            throw blockedUserError();
+          }
+        }
 
         // Registration is the one place where `role` is allowed, but a browser
         // may only choose a public role. Admin needs BOTH the explicit seed-only
@@ -317,6 +470,27 @@ export function createAuth(env, options = {}) {
         // other paths bypass this check entirely.
         if (isEmailRegistration && 'password' in body) {
           validateEmailPassword(body.password);
+        }
+
+        // Keep the same complexity rule when a signed-in user changes it.
+        if (isPasswordChange && 'newPassword' in body) {
+          validateEmailPassword(body.newPassword);
+        }
+      }),
+
+      after: createAuthMiddleware(async (ctx) => {
+        const path = typeof ctx.path === 'string' ? ctx.path : '';
+        const needsBlockCheck =
+          path.startsWith('/sign-in') || SESSION_CONSUMING_PATHS.has(path);
+
+        if (!needsBlockCheck) {
+          return;
+        }
+
+        const user = await userFromAuthResult(ctx);
+
+        if (isBlockedUser(user)) {
+          throw blockedUserError();
         }
       }),
     },

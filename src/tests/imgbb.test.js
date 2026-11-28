@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict';
+import { PassThrough, Writable } from 'node:stream';
 import { test } from 'node:test';
 
 import {
+  createBodySizeGuard,
   createImageUploader,
   createImgbbUploader,
+  IMGBB_UPLOAD_TIMEOUT_MS,
   MAX_IMAGE_FILE_SIZE_BYTES,
   MAX_IMAGES_PER_ITEM,
   MAX_UPLOAD_BODY_SIZE_BYTES,
@@ -327,4 +330,84 @@ test('ImgBB uploader rejects a returned URL that is not http or https', async ()
   await assert.rejects(() => uploader.uploadImages([makeFile()]), {
     code: 'IMAGE_UPLOAD_FAILED',
   });
+});
+
+test('chunked upload bodies over the real byte limit are rejected while streaming', async () => {
+  assert.ok(IMGBB_UPLOAD_TIMEOUT_MS > 0);
+
+  const request = new PassThrough();
+  let deliveredBytes = 0;
+  const busboy = new Writable({
+    write(chunk, _encoding, callback) {
+      deliveredBytes += chunk.length;
+      callback();
+    },
+  });
+  const busboyError = new Promise((resolve) => busboy.once('error', resolve));
+
+  createBodySizeGuard({ limit: 10 })(request, busboy);
+  request.write(Buffer.alloc(6));
+  request.write(Buffer.alloc(6));
+
+  const error = await busboyError;
+
+  assert.equal(error.statusCode, 413);
+  assert.equal(error.code, 'PAYLOAD_TOO_LARGE');
+  assert.ok(deliveredBytes <= 10);
+});
+
+test('an ImgBB fetch timeout becomes the same safe upload failure', async () => {
+  let signal;
+  const uploader = createImgbbUploader(
+    { IMGBB_API_KEY: API_KEY },
+    {
+      timeoutMs: 5,
+      fetch: (_url, options) => {
+        signal = options.signal;
+
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener('abort', () => reject(new Error('aborted by test')), {
+            once: true,
+          });
+        });
+      },
+    },
+  );
+
+  await assert.rejects(() => uploader.uploadImages([makeFile()]), {
+    code: 'IMAGE_UPLOAD_FAILED',
+    message: 'Image upload failed. Please try again.',
+  });
+
+  assert.equal(signal.aborted, true);
+});
+
+test('an ImgBB response body timeout becomes the same safe upload failure', async () => {
+  let signal;
+  const uploader = createImgbbUploader(
+    { IMGBB_API_KEY: API_KEY },
+    {
+      timeoutMs: 5,
+      fetch: (_url, options) => {
+        signal = options.signal;
+
+        return Promise.resolve({
+          ok: true,
+          json: () =>
+            new Promise((_resolve, reject) => {
+              signal.addEventListener('abort', () => reject(new Error('body stalled')), {
+                once: true,
+              });
+            }),
+        });
+      },
+    },
+  );
+
+  await assert.rejects(() => uploader.uploadImages([makeFile()]), {
+    code: 'IMAGE_UPLOAD_FAILED',
+    message: 'Image upload failed. Please try again.',
+  });
+
+  assert.equal(signal.aborted, true);
 });

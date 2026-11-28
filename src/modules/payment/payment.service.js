@@ -198,6 +198,56 @@ function isDuplicateKeyError(error) {
   );
 }
 
+/**
+ * Webhooks can be retried or delivered concurrently. Use the declared priority
+ * when present and fall back to the event type, so older code paths are safe.
+ */
+function transactionEventPriority(specification) {
+  const explicit = Number(specification.eventPriority);
+
+  if (Number.isFinite(explicit)) {
+    return Math.floor(explicit);
+  }
+
+  return STRIPE_EVENT_PRIORITY[specification.eventType] ?? 0;
+}
+
+function transactionOrderGuard(specification, priority) {
+  return {
+    $or: [
+      { stripeEventCreated: { $exists: false } },
+      { stripeEventCreated: null },
+      { stripeEventCreated: { $lt: specification.eventCreated } },
+      {
+        $and: [
+          { stripeEventCreated: specification.eventCreated },
+          {
+            $or: [
+              { stripeEventPriority: { $lte: priority } },
+              { stripeEventPriority: { $exists: false } },
+              { stripeEventPriority: null },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+}
+
+function isStaleTransaction(existing, specification, priority) {
+  if (!existing) {
+    return false;
+  }
+
+  const existingCreated = Number(existing.stripeEventCreated ?? -Infinity);
+  const existingPriority = Number(existing.stripeEventPriority ?? 0);
+
+  return (
+    existingCreated > specification.eventCreated ||
+    (existingCreated === specification.eventCreated && existingPriority > priority)
+  );
+}
+
 function isMissingStripeResource(error) {
   return error?.code === 'resource_missing' || error?.statusCode === 404;
 }
@@ -411,23 +461,25 @@ export function createPaymentService(dependencies = {}) {
 
   /**
    * One transaction per Stripe identifier. The invoice unique index is the
-   * atomic duplicate guard; the event timestamp prevents stale overwrites.
+   * atomic duplicate guard; timestamp plus event priority prevents a stale
+   * retry from replacing the latest payment state.
    */
   async function upsertTransaction(specification) {
     const collection = getTransactions();
-    const filter = specification.stripeInvoiceId
+    const stripeKey = specification.stripeInvoiceId
       ? { stripeInvoiceId: specification.stripeInvoiceId }
       : { stripeSessionId: specification.stripeCheckoutSessionId };
+    const filter = { ...stripeKey };
+    const priority = transactionEventPriority(specification);
     const existing = await collection.findOne(filter);
 
-    if (existing && Number(existing.stripeEventCreated ?? 0) > specification.eventCreated) {
+    if (isStaleTransaction(existing, specification, priority)) {
       return false;
     }
 
     const timestamp = now();
     const onInsert = {
       vendorId: specification.vendorId,
-      stripeSubscriptionId: specification.stripeSubscriptionId,
       createdAt: timestamp,
       ...(specification.stripeInvoiceId ? { stripeInvoiceId: specification.stripeInvoiceId } : {}),
       ...(specification.stripeCheckoutSessionId
@@ -437,6 +489,8 @@ export function createPaymentService(dependencies = {}) {
           }
         : {}),
     };
+    // `stripeSubscriptionId` belongs only here. MongoDB rejects an upsert whose
+    // update document writes the same path in both $set and $setOnInsert.
     const set = {
       paymentStatus: specification.paymentStatus,
       // `status` is retained for the existing admin/index contract.
@@ -446,27 +500,37 @@ export function createPaymentService(dependencies = {}) {
       stripeSubscriptionId: specification.stripeSubscriptionId,
       stripeEventId: specification.eventId,
       stripeEventCreated: specification.eventCreated,
+      stripeEventPriority: priority,
       eventType: specification.eventType,
       updatedAt: timestamp,
     };
 
+    // Put the ordering guard in the write itself. A concurrent retry with an
+    // older timestamp (or the same timestamp but a lower priority) matches no
+    // document and cannot overwrite the newer state between findOne and update.
+    filter.$and = [transactionOrderGuard(specification, priority)];
+
     try {
-      await collection.updateOne(filter, { $setOnInsert: onInsert, $set: set }, { upsert: true });
+      const result = await collection.updateOne(
+        filter,
+        { $setOnInsert: onInsert, $set: set },
+        { upsert: true },
+      );
+
+      if ((result?.matchedCount ?? 0) === 0 && (result?.upsertedCount ?? 0) === 0) {
+        return false;
+      }
+
       return true;
     } catch (error) {
       if (!isDuplicateKeyError(error)) {
         throw toSafePaymentError(error);
       }
 
-      // Another delivery inserted the same immutable Stripe id first.
+      // Another delivery inserted the same immutable Stripe id first. Apply
+      // the identical timestamp/priority guard in the fallback path.
       const result = await collection.updateOne(
-        {
-          ...filter,
-          $or: [
-            { stripeEventCreated: { $lte: specification.eventCreated } },
-            { stripeEventCreated: { $exists: false } },
-          ],
-        },
+        { ...stripeKey, $and: [transactionOrderGuard(specification, priority)] },
         { $set: set },
       );
 

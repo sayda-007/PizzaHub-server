@@ -10,6 +10,7 @@ import {
   createAuthenticate,
   findUserById,
 } from '../middlewares/authenticate.js';
+import { findActiveTestSession } from './auth-session-helper.js';
 import { createErrorHandler } from '../middlewares/error.js';
 import { notFound } from '../middlewares/not-found.js';
 import { createAdminRoutes } from '../modules/admin/admin.routes.js';
@@ -651,9 +652,10 @@ before(async () => {
           throw new Error('invalid test token');
         }
 
-        return { sub: subject, role: TOKEN_CLAIM_ROLES[token] };
+        return { sub: subject, sid: subject, role: TOKEN_CLAIM_ROLES[token] };
       },
       findUser: async (userId) => fakeUsers.findOne(buildUserIdFilter(userId)),
+      findSession: findActiveTestSession,
     },
   );
 
